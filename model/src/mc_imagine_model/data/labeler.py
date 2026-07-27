@@ -3,6 +3,12 @@ Module for auto-labeling extracted chunks with text descriptions.
 
 Provides heuristic-based labeling approaches based on chunk contents,
 biomes, and structures.
+
+This covers the "procedural bootstrap" and "mined builds" data sourcing strategies described in
+PROJECT.md's "Model Training Pipeline" section (templated captions from known generation
+parameters, or from heuristics over extracted chunk contents). Human-authored prompts and
+LLM-paraphrased caption augmentation are separate, non-heuristic sourcing paths that feed into
+McImagineDataset the same way but don't belong in this module.
 """
 
 from typing import Dict, Any, List
