@@ -4,4 +4,12 @@ architectury {
 
 dependencies {
     modImplementation "dev.architectury:architectury:${rootProject.architectury_version}"
+    implementation "com.microsoft.onnxruntime:onnxruntime:1.19.2"
+    testImplementation "org.junit.jupiter:junit-jupiter-api:5.10.0"
+    testRuntimeOnly "org.junit.jupiter:junit-jupiter-engine:5.10.0"
+    testImplementation "org.mockito:mockito-core:5.5.0"
+}
+
+test {
+    useJUnitPlatform()
 }

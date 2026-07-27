@@ -18,6 +18,7 @@ subprojects {
     dependencies {
         minecraft "com.mojang:minecraft:${rootProject.minecraft_version}"
         mappings loom.officialMojangMappings()
+        implementation "com.microsoft.onnxruntime:onnxruntime:1.19.2"
     }
 
     java {
@@ -29,6 +30,7 @@ subprojects {
 
 allprojects {
     repositories {
+        mavenCentral()
         maven { url "https://maven.architectury.dev/" }
         maven { url "https://api.modrinth.com/maven" }
     }

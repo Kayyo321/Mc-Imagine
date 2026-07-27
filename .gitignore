@@ -53,3 +53,6 @@ crash-reports/
 .env
 .env.local
 mod/fabric/run/
+
+# Agent orchestration scratch state (not project source)
+.agents/
