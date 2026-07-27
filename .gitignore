@@ -1,0 +1,54 @@
+# Java/Gradle
+build/
+.gradle/
+*.class
+*.jar
+bin/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+dist/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.eclipse/
+.metadata/
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Model artifacts (distributable .mcim are allowed)
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Datasets
+data/raw/
+data/processed/
+*.sqlite3
+
+# Logs
+*.log
+logs/
+crash-reports/
+
+# Env files
+.env
+.env.local
