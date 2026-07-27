@@ -18,4 +18,4 @@ public class ModelSession implements AutoCloseable {
     public void close() throws Exception {
         // Cleanup ONNX resources
     }
-}\n
+}

@@ -12,4 +12,4 @@ public class PromptParser {
     public void extractStructureConstraints() {
         // Blacklist/whitelist logic
     }
-}\n
+}

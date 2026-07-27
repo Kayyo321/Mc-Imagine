@@ -8,4 +8,4 @@ public class McImagineFabric implements ModInitializer {
     public void onInitialize() {
         McImagine.init();
     }
-}\n
+}

@@ -6,4 +6,4 @@ public record ParsedPrompt(
     int[] tokens,
     Map<String, Float> structureWeights,
     String normalizedText
-) {}\n
+) {}

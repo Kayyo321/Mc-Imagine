@@ -32,4 +32,4 @@ shadowJar {
 remapJar {
     inputFile.set(shadowJar.archiveFile)
     dependsOn shadowJar
-}\n
+}

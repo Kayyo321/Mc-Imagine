@@ -14,6 +14,9 @@
   "entrypoints": {
     "main": [
       "com.mcimagine.fabric.McImagineFabric"
+    ],
+    "client": [
+      "com.mcimagine.fabric.McImagineFabricClient"
     ]
   },
   "depends": {
@@ -22,4 +25,4 @@
     "minecraft": "1.20.1",
     "architectury": ">=9.2.14"
   }
-}\n
+}

@@ -6,4 +6,4 @@ public class McImagineConfig {
     public int cacheSize = 1024;
     public int maxGenerationThreads = 4;
     public String logLevel = "INFO";
-}\n
+}

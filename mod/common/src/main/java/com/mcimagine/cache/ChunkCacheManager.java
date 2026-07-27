@@ -9,4 +9,4 @@ public class ChunkCacheManager {
     public ChunkCacheManager(int cacheSize) {
         this.cacheSize = cacheSize;
     }
-}\n
+}

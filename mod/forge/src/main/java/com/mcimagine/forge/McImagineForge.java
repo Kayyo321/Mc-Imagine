@@ -8,4 +8,4 @@ public class McImagineForge {
     public McImagineForge() {
         McImagine.init();
     }
-}\n
+}

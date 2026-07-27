@@ -6,4 +6,4 @@ public record ChunkInput(
     long seed,
     int[] promptTokens,
     byte[] neighborContext
-) {}\n
+) {}

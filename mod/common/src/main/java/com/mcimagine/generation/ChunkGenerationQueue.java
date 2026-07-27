@@ -6,4 +6,4 @@ package com.mcimagine.generation;
  */
 public class ChunkGenerationQueue {
     // TODO: Queue implementation
-}\n
+}

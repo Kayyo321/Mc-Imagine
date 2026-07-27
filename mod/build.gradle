@@ -32,4 +32,4 @@ allprojects {
         maven { url "https://maven.architectury.dev/" }
         maven { url "https://api.modrinth.com/maven" }
     }
-}\n
+}

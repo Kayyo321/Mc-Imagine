@@ -1,0 +1,20 @@
+{
+  "generator.mcimagine.imagine_generator": "Mc-Imagine AI Chunk Generator",
+  "generator.mcimagine.imagine": "Mc-Imagine AI World",
+  
+  "mcimagine.gui.create_world.title": "Create Mc-Imagine World",
+  "mcimagine.gui.prompt": "World Prompt",
+  "mcimagine.gui.prompt.hint": "Describe your world here (e.g. A lush desert with massive sand dunes and hidden oases...)",
+  "mcimagine.gui.seed": "Seed (Optional)",
+  "mcimagine.gui.model": "Model",
+  "mcimagine.gui.model.placeholder": "ImagineBase (Default)",
+  "mcimagine.gui.generate": "Generate AI World",
+  "mcimagine.gui.cancel": "Cancel",
+  "mcimagine.gui.select_world.create_ai_world": "Create AI World",
+
+  "mcimagine.gui.customize.title": "Customize Mc-Imagine World",
+  "mcimagine.gui.customize.prompt_label": "World Generation Prompt",
+  "mcimagine.gui.customize.no_models": "No AI models found!\n\nPlease place .mcim model files into the following directory:\n%s\n\nModels can be downloaded from the Mc-Imagine project page.",
+  "mcimagine.gui.customize.done": "Done",
+  "mcimagine.gui.customize.cancel": "Cancel"
+}

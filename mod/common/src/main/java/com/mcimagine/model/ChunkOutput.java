@@ -5,4 +5,4 @@ public record ChunkOutput(
     int[] blockVolume,
     int[] biomeGrid,
     float[][] structureMarkers
-) {}\n
+) {}

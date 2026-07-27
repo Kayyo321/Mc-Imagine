@@ -6,4 +6,4 @@ public record ModelInfo(
     String author,
     String description,
     String path
-) {}\n
+) {}

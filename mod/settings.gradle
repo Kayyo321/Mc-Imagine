@@ -7,4 +7,4 @@ pluginManagement {
     }
 }
 rootProject.name = "mc-imagine"
-include "common", "fabric", "forge"\n
+include "common", "fabric", "forge"

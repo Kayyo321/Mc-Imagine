@@ -28,4 +28,4 @@ authors="Mc-Imagine Team"
     mandatory=true
     versionRange="[9.2.14,)"
     ordering="NONE"
-    side="BOTH"\n
+    side="BOTH"

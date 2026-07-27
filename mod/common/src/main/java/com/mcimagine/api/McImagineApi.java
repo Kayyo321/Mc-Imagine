@@ -10,4 +10,4 @@ public interface McImagineApi {
     Optional<ModelInfo> getActiveModel();
     List<ModelInfo> getAvailableModels();
     String getActivePrompt();
-}\n
+}

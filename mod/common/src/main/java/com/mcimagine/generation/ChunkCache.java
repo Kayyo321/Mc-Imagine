@@ -5,4 +5,4 @@ package com.mcimagine.generation;
  */
 public class ChunkCache {
     // TODO: Cache implementation
-}\n
+}

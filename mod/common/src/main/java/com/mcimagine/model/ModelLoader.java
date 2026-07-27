@@ -17,7 +17,30 @@ public class ModelLoader {
     }
 
     public List<ModelInfo> discoverModels() {
-        return Collections.emptyList(); // TODO: Implement discovery
+        if (!java.nio.file.Files.exists(modelsDirectory)) {
+            try {
+                java.nio.file.Files.createDirectories(modelsDirectory);
+            } catch (java.io.IOException e) {
+                e.printStackTrace();
+            }
+            return Collections.emptyList();
+        }
+
+        try (java.util.stream.Stream<Path> paths = java.nio.file.Files.list(modelsDirectory)) {
+            return paths
+                .filter(p -> java.nio.file.Files.isRegularFile(p) && p.toString().endsWith(".mcim"))
+                .map(p -> new ModelInfo(
+                    p.getFileName().toString().replace(".mcim", ""),
+                    "1.0",
+                    "Unknown",
+                    "A Minecraft Imagine model.",
+                    p.toAbsolutePath().toString()
+                ))
+                .toList();
+        } catch (java.io.IOException e) {
+            e.printStackTrace();
+            return Collections.emptyList();
+        }
     }
 
     public void loadModel(ModelInfo model) {
@@ -31,4 +54,4 @@ public class ModelLoader {
     public boolean isModelLoaded() {
         return isLoaded;
     }
-}\n
+}

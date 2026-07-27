@@ -5,4 +5,4 @@ package com.mcimagine.prompt;
  */
 public class PromptTokenizer {
     // Tokenization logic mapping words/subwords to IDs
-}\n
+}
