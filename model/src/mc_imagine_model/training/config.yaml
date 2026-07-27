@@ -1,0 +1,23 @@
+# Default training configuration
+
+model:
+  embed_dim: 256
+  num_heads: 8
+  num_layers: 6
+  vocab_size: 50000
+
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  num_epochs: 100
+  checkpoint_dir: "./checkpoints"
+
+data:
+  data_dir: "./data"
+  max_prompt_length: 64
+  augmentation: true
+
+hardware:
+  device: "auto"
+  num_workers: 4
+  mixed_precision: true

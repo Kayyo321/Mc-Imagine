@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mc-imagine-model"
+version = "0.1.0"
+description = "AI model training pipeline for Mc-Imagine world generation"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-only"}
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "onnx",
+    "onnxruntime",
+    "tqdm",
+    "pyyaml",
+    "pillow"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    "mypy"
+]
+training = [
+    "tensorboard",
+    "wandb",
+    "hydra-core"
+]
+
+[project.scripts]
+mc-imagine-train = "mc_imagine_model.training.train:main"
+mc-imagine-export = "mc_imagine_model.export.export_onnx:main"

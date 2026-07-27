@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "mcimagine",
+  "version": "${version}",
+  "name": "Mc-Imagine",
+  "description": "AI-powered world generation for Minecraft. Describe a world, play in it.",
+  "authors": [
+    "Mc-Imagine Team"
+  ],
+  "contact": {},
+  "license": "GPL-3.0-only",
+  "icon": "assets/mcimagine/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.mcimagine.fabric.McImagineFabric"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "fabric-api": "*",
+    "minecraft": "1.20.1",
+    "architectury": ">=9.2.14"
+  }
+}\n

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Basic gradlew wrapper script placeholder
+echo "Downloading and setting up Gradle..."
+# Real gradle wrapper would be larger, but this works for simple invocation placeholder
+gradle_cmd="gradle"
+if command -v $gradle_cmd >/dev/null 2>&1; then
+    exec $gradle_cmd "$@"
+else
+    echo "Gradle not found."
+    exit 1
+fi\n
