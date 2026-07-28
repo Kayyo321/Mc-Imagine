@@ -1,6 +1,8 @@
 # Mc-Imagine
 > Describe a world. Play in it.
 
+<img src="Imgs/Day1ProofOfConcept.png" alt="PoC Photo" width="50%">
+
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 ![Minecraft Version: 1.20.1](https://img.shields.io/badge/Minecraft-1.20.1-brightgreen.svg)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)
