@@ -34,14 +34,20 @@ Mc-Imagine is a two-part system that revolutionizes Minecraft world generation b
 #### Building from Source
 **Mod:**
 ```bash
+cd mod
 ./gradlew build
 ```
 **Python Pipeline Setup:**
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e model/
 ```
+
+`pip install -e model/` is required — it installs the pinned dependencies *and* puts
+`mc_imagine_model` on the import path, which every `python -m mc_imagine_model.…` command needs.
+On an NVIDIA box, install the CUDA-matched torch wheel as well; see
+**[docs/TRAINING.md](docs/TRAINING.md)** for the complete clone → train → export → play walkthrough.
 
 #### Project Structure
 - `mod/` - Architectury Minecraft mod source code

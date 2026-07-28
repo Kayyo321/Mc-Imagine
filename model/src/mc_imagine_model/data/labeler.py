@@ -11,14 +11,22 @@ and the actual rendered terrain never drift apart — this is exactly the "check
 template-to-parameter mapping is actually discriminative" property docs/poc-plan.md's Phase 5 gate
 calls out as the fix if the trained model collapses to the caption prior.
 
-Roughly 40 templates (5-6 per archetype) x 3-5 synonym choices per slot gives thousands of distinct
-surface forms without needing an LLM paraphrase pass. `ChunkLabeler.label_region` is the primary
-entry point; `maybe_paraphrase` is a documented no-op standing in for the LLM-augmentation strategy
-`config.yaml`'s `data.augmentation` flag names (see its docstring for why it's a no-op here).
+Roughly 50 templates (4-6 per archetype) x 3-5 synonym choices per slot, plus the
+parameter-grounded modifiers `label_region` appends, gives thousands of distinct surface forms
+without needing an LLM paraphrase pass. `ChunkLabeler.label_region` is the primary entry point;
+`maybe_paraphrase` is a documented no-op standing in for the LLM-augmentation strategy
+the training config's `data.augmentation` flag names (see its docstring for why it's a no-op here).
+
+Two import-time assertions below (see "coverage guards") tie this module to
+`world_generator.ARCHETYPES`: a new archetype without templates, or a template slot without
+synonyms, is a hard failure rather than a silent fallback to `rolling_grassland` captions.
 """
 
 import random
+import string
 from typing import Any, Dict, List
+
+from mc_imagine_model.data.world_generator import ARCHETYPES
 
 
 SYNONYMS: Dict[str, List[str]] = {
@@ -54,6 +62,17 @@ SYNONYMS: Dict[str, List[str]] = {
     "taiga": ["taiga", "boreal forest", "conifer forest", "pine forest"],
     "savanna": ["savanna", "open grassland", "dry plain"],
     "scattered": ["scattered", "sparse", "widely spaced"],
+    # --- Phase 2: vocabulary for the `deep_canyon` and `fjord_rift` archetypes ------------------
+    "canyon": ["canyon", "gorge", "chasm", "rift"],
+    "plunging": ["plunging", "sheer", "vertiginous", "precipitous"],
+    "arid": ["arid", "parched", "sun-baked", "rainless"],
+    "terrace": ["terrace", "ledge", "bench", "stepped shelf"],
+    "floor": ["floor", "bed", "bottom"],
+    "fjord": ["fjord", "inlet", "sound", "sea-loch"],
+    "cliff": ["cliff", "rock wall", "escarpment", "cliff face"],
+    "narrow": ["narrow", "slender", "tight", "hemmed-in"],
+    "cold": ["cold", "icy", "frigid", "glacial"],
+    "deep_water": ["deep water", "black water", "fathomless water", "dark cold water"],
 }
 
 
@@ -66,6 +85,33 @@ def _fill(rng: random.Random, template: str, **overrides: str) -> str:
     return template.format_map(filler)
 
 
+def _tidy(text: str) -> str:
+    """Cleans up the two artefacts that fall out of filling independent synonym slots: indefinite
+    articles that disagree with whatever word the slot happened to draw ("an vast desert"), and an
+    immediately repeated stem when two slots share a synonym ("{mesa} {plateau}s" -> "plateau
+    plateaus"). Both were present in the Day-1 captions and are pure noise in the training text.
+    """
+    words = text.split(" ")
+    out: List[str] = []
+    for word in words:
+        if out and _stem(out[-1]) and _stem(out[-1]) == _stem(word):
+            out[-1] = word  # keep the later form, which carries the suffix/punctuation
+            continue
+        out.append(word)
+    for i in range(len(out) - 1):
+        lowered = out[i].lower()
+        if lowered in ("a", "an"):
+            nxt = out[i + 1].lstrip("\"'(")
+            article = "an" if nxt[:1].lower() in "aeiou" else "a"
+            out[i] = article.capitalize() if out[i][:1].isupper() else article
+    return " ".join(out)
+
+
+def _stem(word: str) -> str:
+    core = word.strip(",.;:!?\"'()").lower()
+    return core[:-1] if core.endswith("s") and len(core) > 3 else core
+
+
 # --- templates, keyed by data/world_generator.py archetype name ---------------------------------
 _TEMPLATES: Dict[str, List[str]] = {
     "valley_mountains_craters": [
@@ -75,6 +121,30 @@ _TEMPLATES: Dict[str, List[str]] = {
         "{deep} {valley}s carved between {beautiful} {mountain} ranges, {water}-filled {crater}s scattered below",
         "{towering}, {beautiful} {mountain}s rising above {vast} {deep} {valley}s and shimmering {water}-filled {crater}s",
         "an {beautiful} range of {mountain}s cut by {deep} {valley}s, each {crater} pooling with {water}",
+    ],
+    # Phase 2 archetype. The discriminative signal a reader should pick up is *extreme depth* plus
+    # *stepped, arid, red rock* — deep_canyon is the only archetype combining the project's largest
+    # relief_amplitude/erosion with high plateau_quantization, so terraces and canyon floors far
+    # below the rim are what separates it from `valley_mountains_craters` (wetter, unterraced) and
+    # from `mesa_plateaus` (terraced but shallow).
+    "deep_canyon": [
+        "{vast} {arid} {canyon}s cut {deep} into {red} rock, their {floor}s far below the {plateau} rim",
+        "a {plunging} {red} {canyon} system, {terrace}d walls dropping hundreds of blocks to a dry {floor}",
+        "{deep}, {plunging} {canyon}s carved through {arid} {red} {plateau} country",
+        "an {arid} tableland split open by {plunging} {canyon}s, {terrace} upon {terrace} of {red} rock down to the {floor}",
+        "{vast} {red} {plateau}s torn open by {deep} {canyon}s with sheer, stepped walls",
+        "a {bone_dry} {canyon} land of flat {plateau} tops and {plunging} drops to the {canyon} {floor}",
+    ],
+    # Phase 2 archetype. Discriminative signal: *steep walls plunging straight into deep cold
+    # water*, in narrow inlets — the only archetype with both near-max ridge_sharpness/erosion and a
+    # water_level sitting inside the carved relief, so the valleys it cuts come out drowned.
+    "fjord_rift": [
+        "{narrow} {fjord}s where {plunging} {cliff}s drop straight into {deep_water}",
+        "a {cold} coast of {narrow} {fjord}s, {plunging} rock walls meeting {deep_water}",
+        "{plunging} {cliff}-walled {fjord}s reaching far inland from a {cold} sea",
+        "a {cold}, {narrow} {fjord} whose {cliff}s fall sheer into {deep_water}",
+        "{deep} glacial {fjord}s, {narrow} arms of {deep_water} hemmed in by {plunging} {cliff}s",
+        "a maze of {narrow}, {cold} {fjord}s between {towering} {plunging} {cliff}s",
     ],
     "desert_dunes": [
         "{flat} {vast} {desert} {dune}s stretching to the horizon",
@@ -132,6 +202,31 @@ _TEMPLATES: Dict[str, List[str]] = {
 }
 
 
+# --- coverage guards ----------------------------------------------------------------------------
+# `label_region` falls back to the `rolling_grassland` templates for an unknown archetype, which is
+# the right behaviour for a stray/legacy params dict but is *silent* — before Phase 2 added
+# `deep_canyon`/`fjord_rift` there was nothing stopping a new archetype from shipping thousands of
+# regions captioned as gentle grassland. These two import-time assertions make that impossible:
+# templates must cover ARCHETYPES exactly, and every `{slot}` used must resolve in SYNONYMS
+# (an unknown slot would otherwise raise KeyError from `_Filler.__missing__` at data-gen time).
+_missing = sorted(set(ARCHETYPES) - set(_TEMPLATES))
+_extra = sorted(set(_TEMPLATES) - set(ARCHETYPES))
+assert not _missing and not _extra, (
+    f"labeler._TEMPLATES must cover world_generator.ARCHETYPES exactly; "
+    f"missing templates for {_missing}, templates for unknown archetypes {_extra}"
+)
+
+_unknown_slots = sorted({
+    field
+    for templates in _TEMPLATES.values()
+    for template in templates
+    for _, field, _, _ in string.Formatter().parse(template)
+    if field
+} - set(SYNONYMS))
+assert not _unknown_slots, f"labeler templates use slots absent from SYNONYMS: {_unknown_slots}"
+del _missing, _extra, _unknown_slots
+
+
 class ChunkLabeler:
     """
     Auto-labels macro-region/chunk data to provide text prompts for conditional generation.
@@ -157,26 +252,98 @@ class ChunkLabeler:
         template = self._rng.choice(templates)
         caption = _fill(self._rng, template)
 
-        # A couple of parameter-grounded modifiers, so captions aren't purely archetype-keyed —
-        # the model also has to learn that *within* an archetype, more extreme parameters read as
-        # more extreme language, not just "which of 9 buckets was this."
+        # Parameter-grounded modifiers, so captions aren't purely archetype-keyed — the model also
+        # has to learn that *within* an archetype, more extreme parameters read as more extreme
+        # language, not just "which of 11 buckets was this."
+        #
+        # Thresholds recalibrated in Phase 2 against 200 freshly rendered regions. The Day-1
+        # thresholds were tuned for the old, narrower parameter ranges and had become pure
+        # archetype restatements once `relief_amplitude` reached 132: `relief_amplitude > 70` fired
+        # for 78-99% of the four high-relief archetypes and 0% of everything else, `erosion > 0.6`
+        # fired for 94-98% of the three canyon-family archetypes and 0-2% elsewhere, and
+        # `water_level > base_height + 8` fired for **0%** of all 4000 sampled regions — dead code.
+        # A modifier that is always-on inside an archetype and always-off outside it carries no
+        # information the archetype name did not already carry.
+        #
+        # Every ladder below now splits *within* the archetypes it applies to (measured firing
+        # rates in the comments), and the depth/flood terms key off quantities that demonstrably
+        # predict the rendered terrain rather than off raw parameters.
         extras: List[str] = []
         relief_amplitude = float(params.get("relief_amplitude", 0.0))
         erosion = float(params.get("erosion", 0.0))
         water_level = float(params.get("water_level", 0.0))
         base_height = float(params.get("base_height", 64.0))
 
-        if archetype not in ("desert_dunes",) and relief_amplitude > 70:
+        # Estimated valley-floor height. `shaped` bottoms out near -0.24 for the ridge-heavy
+        # archetypes and the erosion carve then subtracts up to `0.60 * erosion * amplitude` on top
+        # (see world_generator.render_region and its VALLEY_MASK_SCALE note). Measured correlation
+        # with the actual rendered per-region minimum is 0.64, and regions with est_floor < 25 have
+        # a mean true minimum of 49.8 vs 62.1 for the rest — so "deep"/"plunging" language really
+        # does track the parameters that produce depth, which raw `relief_amplitude` alone did not.
+        est_floor = base_height - 0.24 * relief_amplitude - 0.60 * erosion * relief_amplitude
+        # Fraction of the region's vertical span that ends up under water. Separates cleanly:
+        # regions passing this test average 31% of columns submerged, regions failing it 0%.
+        floods_low_ground = water_level > est_floor + 0.45 * (base_height - est_floor)
+
+        # Relief ladder. Splits deep_canyon 44/56, fjord_rift 50/50, snow_peaks 32/64 across the
+        # top two rungs; `mesa_plateaus` lands almost entirely on the third; the "level" rung is the
+        # first modifier the flat archetypes have ever been eligible for.
+        if relief_amplitude > 100:
+            extras.append("with colossal, sheer changes in elevation")
+        elif relief_amplitude > 68:
             extras.append("with dramatic, extreme elevation changes")
-        if archetype not in ("desert_dunes", "mesa_plateaus") and erosion > 0.6:
-            extras.append("heavily eroded by ancient water flow")
-        if water_level > base_height + 8 and archetype not in ("tropical_archipelago", "swamp"):
-            extras.append("partially flooded by a large lake")
+        elif relief_amplitude > 40:
+            extras.append("with pronounced ridges and hollows")
+        elif relief_amplitude > 18 and archetype == "desert_dunes":
+            extras.append("its dunes piled high and steep")
+        elif relief_amplitude < 12 and archetype != "swamp":
+            # `swamp` is 92% below this threshold, so the modifier would be pure archetype
+            # restatement there; desert_dunes gets its own wording (70%/12% low/high split) so that
+            # the one archetype excluded from every other ladder still has *some* parameter
+            # grounding rather than identical captions at amplitude 3 and amplitude 20.
+            extras.append(
+                "its dunes low and shallow" if archetype == "desert_dunes"
+                else "barely rising above level ground"
+            )
 
-        if extras and self._rng.random() < 0.5:
-            caption = caption + ", " + self._rng.choice(extras)
+        # Erosion ladder. Excluded for the two archetypes whose templates already carry the word
+        # ({bone_dry} desert, {eroded} mesa). Splits deep_canyon 56/44 and fjord_rift 20/70.
+        if archetype not in ("desert_dunes", "mesa_plateaus"):
+            if erosion > 0.85:
+                extras.append("deeply eroded by ancient water flow")
+            elif erosion > 0.55:
+                extras.append("worn down by long erosion")
+            elif erosion < 0.15 and archetype not in ("tropical_archipelago", "swamp"):
+                # would contradict the template for the water-dominated archetypes
+                extras.append("untouched by running water")
 
-        return caption
+        # Depth. The `< 25` rung fires for 22% of deep_canyon and 40% of fjord_rift; regions on it
+        # have a mean rendered minimum of 33.5, and 81% of regions on the `25..55` rung really do
+        # dip below sea level. Gated on relief_amplitude so a flat archetype whose base_height
+        # happens to sit low can never be captioned as having valley floors it does not have.
+        if relief_amplitude > 25:
+            if est_floor < 25:
+                extras.append("cut by chasms that plunge far below sea level")
+            elif est_floor < 55:
+                extras.append("with valley floors dipping below sea level")
+
+        # Flooding — replaces the never-firing `water_level > base_height + 8`. Excluded where the
+        # templates already describe the water. Fires for 60% of fjord_rift, 32% of
+        # valley_mountains_craters.
+        if floods_low_ground and archetype not in ("tropical_archipelago", "swamp", "fjord_rift"):
+            extras.append("its low ground drowned under deep water")
+
+        # One modifier most of the time, occasionally two — enough to expose the whole modifier
+        # vocabulary without turning every caption into a parameter dump.
+        if extras:
+            self._rng.shuffle(extras)
+            n_extras = 2 if (len(extras) > 1 and self._rng.random() < 0.22) else (
+                1 if self._rng.random() < 0.62 else 0
+            )
+            for extra in extras[:n_extras]:
+                caption = caption + ", " + extra
+
+        return _tidy(caption)
 
     def label_chunk(self, chunk_data: Dict[str, Any]) -> str:
         """
@@ -214,7 +381,7 @@ def maybe_paraphrase(caption: str, augmentation_enabled: bool) -> str:
     """
     Stands in for data-sourcing strategy 4 ("Caption paraphrasing" in PROJECT.md's "Model Training
     Pipeline" section): an LLM-generated paraphrase pass over templated captions, gated by
-    `config.yaml`'s `data.augmentation` flag.
+    the training config's `data.augmentation` flag.
 
     No LLM API is available in this training environment (no network-callable LLM endpoint is
     configured), so this is a **documented no-op pass-through**, not a fabricated network call:

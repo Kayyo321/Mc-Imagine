@@ -2,22 +2,48 @@
 Basic pytest tests for the Mc-Imagine model components.
 """
 
+import random
+
 import torch
 import pytest
 
-from mc_imagine_model.model.imagine_net import ImagineNet
+from mc_imagine_model.model.imagine_net import ImagineNet, _check_conv_arithmetic
 from mc_imagine_model.model.text_encoder import PromptEncoder
-from mc_imagine_model.model.positional import CoordinateEncoder, SeedEncoder, verify_seed_encoder_varies
-from mc_imagine_model.spec_constants import NUM_BIOMES, NUM_PROFILES
+from mc_imagine_model.model.positional import (
+    CoordinateEncoder,
+    SeedEncoder,
+    seed_to_offset_torch,
+    verify_seed_encoder_varies,
+)
+from mc_imagine_model.spec_constants import (
+    HEIGHT_LOSS_SCALE,
+    HEIGHT_MAX,
+    HEIGHT_MIN,
+    NUM_BIOMES,
+    NUM_PROFILES,
+    OFFSET_RANGE,
+    SLOPE_LOSS_SCALE,
+    seed_to_offset,
+)
 from mc_imagine_model.tokenizer_utils import tokenize
+from mc_imagine_model.training.losses import TerrainLoss
+
+# A small-but-valid config: halo must equal num_conv_layers (each valid 3x3 conv eats one ring),
+# see imagine_net._check_conv_arithmetic.
+SMALL_CONFIG = {
+    "conv_channels": 32,
+    "fusion_hidden": 64,
+    "fusion_out": 32,
+    "num_conv_layers": 4,
+    "halo": 4,
+}
 
 
 def test_imagine_net_forward() -> None:
     """
     Test that the ImagineNet model can perform a forward pass and return expected shapes.
     """
-    config = {"conv_channels": 32, "fusion_hidden": 64, "fusion_out": 32, "num_conv_layers": 4}
-    model = ImagineNet(config)
+    model = ImagineNet(SMALL_CONFIG)
     model.eval()
 
     b = 2
@@ -33,9 +59,56 @@ def test_imagine_net_forward() -> None:
     assert out["profile_logits"].shape == (b, NUM_PROFILES, 16, 16)
     assert out["water_level"].shape == (b, 16, 16)
     assert out["biome_logits"].shape == (b, NUM_BIOMES, 4, 4)
-    # heightmap must be within the 63 +/- 96*tanh band
-    assert torch.all(out["heightmap"] >= 63.0 - 96.0)
-    assert torch.all(out["heightmap"] <= 63.0 + 96.0)
+    # heightmap/water_level must lie in the head's HEIGHT_CENTER +/- HEIGHT_AMPLITUDE band.
+    for key in ("heightmap", "water_level"):
+        assert torch.all(out[key] >= HEIGHT_MIN)
+        assert torch.all(out[key] <= HEIGHT_MAX)
+
+
+def test_imagine_net_phase2_dims() -> None:
+    """The Phase 2 capacity config (docs/phase2-plan.md Phase 2) must build and produce the exact
+    spec'd output shapes. These are the defaults `training/config*.yaml` sets."""
+    config = {
+        "halo": 6,
+        "patch": 16,
+        "conv_channels": 192,
+        "num_conv_layers": 6,
+        "fusion_hidden": 512,
+        "fusion_out": 256,
+        "seed_freqs": 32,
+        "seed_embed_dim": 64,
+        "num_profiles": 8,
+        "num_biomes": 12,
+    }
+    model = ImagineNet(config)
+    model.eval()
+    assert model.coord_encoder.size == 28  # 16 + 2*6
+
+    prompt_tokens = torch.tensor([tokenize("towering snow-capped peaks")], dtype=torch.int32)
+    with torch.no_grad():
+        out = model(
+            prompt_tokens,
+            torch.tensor([3], dtype=torch.int32),
+            torch.tensor([-7], dtype=torch.int32),
+            torch.tensor([12345], dtype=torch.int64),
+        )
+    assert out["heightmap"].shape == (1, 16, 16)
+    assert out["profile_logits"].shape == (1, 8, 16, 16)
+    assert out["water_level"].shape == (1, 16, 16)
+    assert out["biome_logits"].shape == (1, 12, 4, 4)
+
+
+def test_conv_arithmetic_is_asserted() -> None:
+    """halo/num_conv_layers mismatches must fail loudly at construction, not silently emit a
+    wrong-sized tile that only explodes (or worse, doesn't) far downstream."""
+    _check_conv_arithmetic(halo=6, patch=16, num_conv_layers=6)  # the Phase 2 setting
+    _check_conv_arithmetic(halo=4, patch=16, num_conv_layers=4)  # the Day 1 setting
+    with pytest.raises(ValueError):
+        _check_conv_arithmetic(halo=6, patch=16, num_conv_layers=4)
+    with pytest.raises(ValueError):
+        _check_conv_arithmetic(halo=4, patch=16, num_conv_layers=6)
+    with pytest.raises(ValueError):
+        ImagineNet({**SMALL_CONFIG, "halo": 5})
 
 
 def test_prompt_encoder() -> None:
@@ -64,17 +137,95 @@ def test_coordinate_encoder() -> None:
     docs/poc-plan.md §1b and export/export_onnx.py's verify_coordinate_purity, which runs this same
     check against the actual trained/exported model).
     """
-    encoder = CoordinateEncoder(halo=4, patch=16)
-    chunk_x = torch.tensor([0, 1])
-    chunk_z = torch.tensor([0, 0])
-    output = encoder(chunk_x, chunk_z)
-    assert output.shape == (2, encoder.out_channels, 24, 24)
+    for halo in (4, 6):
+        encoder = CoordinateEncoder(halo=halo, patch=16)
+        size = 16 + 2 * halo
+        chunk_x = torch.tensor([0, 1])
+        chunk_z = torch.tensor([0, 0])
+        seed = torch.tensor([12345, 12345], dtype=torch.int64)
+        output = encoder(chunk_x, chunk_z, seed)
+        assert output.shape == (2, encoder.out_channels, size, size)
 
-    # chunk(0,0)'s halo covers global x in [-4, 19]; chunk(1,0)'s halo covers global x in [12, 35].
-    # Shared range [12, 19] -> local index 16..23 in chunk0's grid, local index 0..7 in chunk1's grid.
-    shared_0 = output[0, :, :, 16:24]
-    shared_1 = output[1, :, :, 0:8]
-    assert torch.equal(shared_0, shared_1), "CoordinateEncoder is not a pure function of global coordinate"
+        # chunk(0,0)'s halo covers global x in [-halo, 15+halo]; chunk(1,0)'s covers
+        # [16-halo, 31+halo]. The shared 2*halo columns sit at [16, size) in chunk0's grid and at
+        # [0, size-16) in chunk1's.
+        shared_0 = output[0, :, :, 16:size]
+        shared_1 = output[1, :, :, 0:size - 16]
+        assert shared_0.shape[-1] == 2 * halo
+        assert torch.equal(shared_0, shared_1), (
+            "CoordinateEncoder is not a pure function of (global coordinate, seed)"
+        )
+
+
+def test_seed_to_offset_torch_matches_python() -> None:
+    """The torch mirror of `spec_constants.seed_to_offset` must be *bit-identical* to the Python
+    reference — `data/world_generator.py` uses the Python one to decide where in the canonical
+    noise field the training targets were rendered, so any drift silently trains the model against
+    a translated copy of its own coordinates (docs/phase2-plan.md §1a).
+
+    Covers the pitfalls specifically: negative seeds (torch.fmod vs torch.remainder sign
+    semantics), seeds far beyond float32's 2**24 exact range, and 200 random int64 seeds.
+    """
+    rng = random.Random(20260728)
+    seeds = [
+        0,
+        1,
+        12345,
+        2 ** 61 + 17,
+        -8756019554883095434,
+        -1,
+        -1_000_003,
+        1_000_003,
+        1_000_002,
+        2 ** 63 - 1,
+        -(2 ** 63),
+    ]
+    seeds += [rng.randint(-(2 ** 63), 2 ** 63 - 1) for _ in range(200)]
+
+    got_x, got_z = seed_to_offset_torch(torch.tensor(seeds, dtype=torch.int64))
+    for i, s in enumerate(seeds):
+        exp_x, exp_z = seed_to_offset(s)
+        assert got_x[i].item() == exp_x, f"offset_x mismatch for seed {s}: {got_x[i].item()} != {exp_x}"
+        assert got_z[i].item() == exp_z, f"offset_z mismatch for seed {s}: {got_z[i].item()} != {exp_z}"
+        assert 0 <= exp_x < OFFSET_RANGE and 0 <= exp_z < OFFSET_RANGE
+
+    # Batched and scalar-at-a-time must also agree with each other (no shape-dependent path).
+    for s in seeds[:20]:
+        single_x, single_z = seed_to_offset_torch(torch.tensor([s], dtype=torch.int64))
+        assert (single_x.item(), single_z.item()) == seed_to_offset(s)
+
+    # float32 output must be exact: every offset is an integer < 2**24.
+    assert torch.equal(got_x, torch.round(got_x))
+    assert torch.equal(got_z, torch.round(got_z))
+
+
+def test_coordinate_encoder_applies_seed_offset() -> None:
+    """Different seeds must translate the coordinate frame (different features for the same chunk),
+    and the same seed must reproduce bit-identically (docs/phase2-plan.md §1a: "same seed => same
+    world, different seed => different layout, same character")."""
+    encoder = CoordinateEncoder(halo=6, patch=16)
+    chunk_x = torch.tensor([2, 2, 2])
+    chunk_z = torch.tensor([-5, -5, -5])
+    seeds = torch.tensor([12345, 999_777, 12345], dtype=torch.int64)
+    out = encoder(chunk_x, chunk_z, seeds)
+
+    assert torch.equal(out[0], out[2]), "same seed must be bit-identical"
+    assert not torch.equal(out[0], out[1]), "different seeds must translate the field"
+
+    # The translation must be the one seed_to_offset prescribes: encoding chunk(0,0) at some seed
+    # must equal encoding raw global coordinates shifted by that seed's offset at seed 0's frame.
+    ox, oz = seed_to_offset(12345)
+    zero_ox, zero_oz = seed_to_offset(0)
+    assert (zero_ox, zero_oz) == (0.0, 0.0)  # seed 0 hashes to no translation
+    shifted = encoder(
+        torch.tensor([0]), torch.tensor([0]), torch.tensor([12345], dtype=torch.int64)
+    )
+    # Same thing computed by hand: chunk(0,0)'s local (0,0) column is global block (0,0), which
+    # after the seed translation is sampled at exactly (ox, oz). Local index 6 == halo == block 0.
+    manual = encoder._fourier(
+        torch.tensor([[[ox]]], dtype=torch.float32), torch.tensor([[[oz]]], dtype=torch.float32)
+    )
+    assert torch.equal(shifted[0, :, 6, 6], manual[0, :, 0, 0])
 
 
 def test_seed_encoder_varies() -> None:
@@ -93,3 +244,107 @@ def test_seed_encoder_deterministic() -> None:
     with torch.no_grad():
         out = encoder(seed)
     assert torch.equal(out[0], out[1])
+
+
+def test_terrain_head_range_covers_ground_truth() -> None:
+    """The head must be able to *reach* the terrain the generator produces. Day 1's `63 + 96*tanh`
+    ceiling of 159 sat below ground truth's 235, so the head saturated and killed all relief
+    (docs/phase2-plan.md §0). Asserting the band here is the cheap regression guard."""
+    from mc_imagine_model.model.heads import TerrainHead
+    from mc_imagine_model.spec_constants import TERRAIN_CLIP_MAX, TERRAIN_CLIP_MIN
+
+    assert HEIGHT_MIN < TERRAIN_CLIP_MIN < TERRAIN_CLIP_MAX < HEIGHT_MAX, (
+        "the generator's clip band must sit strictly inside the head's representable band, so no "
+        "target ever lands on the tanh asymptote where the gradient vanishes"
+    )
+    assert HEIGHT_MAX >= 236, "must cover the 235.6 max the ground-truth data reaches"
+
+    head = TerrainHead(in_channels=8, num_profiles=NUM_PROFILES)
+    # Drive the 1x1 convs hard in both directions; tanh must approach, and never exceed, the band.
+    with torch.no_grad():
+        for w in (-50.0, 50.0):
+            head.height_conv.weight.fill_(w)
+            head.height_conv.bias.fill_(w)
+            head.water_conv.weight.fill_(w)
+            head.water_conv.bias.fill_(w)
+            feats = torch.ones(1, 8, 16, 16)
+            heightmap, _, water = head(feats)
+            for t in (heightmap, water):
+                assert torch.all(t >= HEIGHT_MIN) and torch.all(t <= HEIGHT_MAX)
+            if w > 0:
+                assert heightmap.min().item() > 236, "the top of the band must be reachable"
+            else:
+                assert heightmap.max().item() < -60, "the bottom of the band must be reachable"
+
+
+def test_terrain_loss_penalizes_flat_prediction() -> None:
+    """The point of the slope term (docs/phase2-plan.md Phase 2): a perfectly flat prediction at the
+    target's mean height is a strong local optimum for absolute-height MSE alone, which is what let
+    the Day-1 model output std 0.03 terrain. With the slope term, the flat solution must cost
+    strictly more than a rough one that shares the same absolute-height error."""
+    torch.manual_seed(0)
+    b = 4
+    target_h = 96.0 + 20.0 * torch.randn(b, 16, 16)
+    targets = {
+        "heightmap": target_h,
+        "profile_id": torch.zeros(b, 16, 16, dtype=torch.long),
+        "water_level": torch.full((b,), 63.0),
+    }
+
+    def preds_for(height: torch.Tensor):
+        return {
+            "heightmap": height,
+            "profile_logits": torch.zeros(b, NUM_PROFILES, 16, 16),
+            "water_level": torch.full((b, 16, 16), 63.0),
+        }
+
+    flat = target_h.mean(dim=(1, 2), keepdim=True).expand_as(target_h).contiguous()
+
+    with_slope = TerrainLoss(slope_weight=1.0)
+    without_slope = TerrainLoss(slope_weight=0.0)
+
+    # The slope term is exactly the extra price the flat solution pays.
+    flat_penalty = with_slope(preds_for(flat), targets) - without_slope(preds_for(flat), targets)
+    assert flat_penalty > 0.0
+
+    # And the perfect prediction still costs nothing extra.
+    perfect_penalty = (
+        with_slope(preds_for(target_h), targets) - without_slope(preds_for(target_h), targets)
+    )
+    assert abs(perfect_penalty.item()) < 1e-9
+
+    # The scales come from spec_constants, where the measurements behind them are recorded.
+    # Deliberately NOT pinned to the head's tanh amplitude: normalizing by the head's output range
+    # is the intuitive choice and was measured to be badly wrong (see below).
+    assert TerrainLoss.HEIGHT_SCALE == HEIGHT_LOSS_SCALE
+    assert TerrainLoss.SLOPE_SCALE == SLOPE_LOSS_SCALE
+
+    # REGRESSION GUARD. Normalizing the slope term by the head amplitude (192) instead of a
+    # per-block step (~1) measured the slope loss at 2.7e-5 against cross-entropies of ~2.1-2.5 —
+    # three orders of magnitude down, so the relief supervision this class exists for contributed
+    # essentially nothing to the gradient and the flat solution stayed optimal in practice. Assert
+    # the flat-prediction slope penalty is a *material* fraction of the total loss, not merely > 0,
+    # so a future rescaling can't silently make this term inert again.
+    total_flat = with_slope(preds_for(flat), targets)
+    assert flat_penalty / total_flat > 0.05, (
+        f"slope penalty {flat_penalty.item():.3e} is only "
+        f"{100 * (flat_penalty / total_flat).item():.4f}% of the total loss "
+        f"{total_flat.item():.3e} — the relief term has been scaled into irrelevance"
+    )
+
+    # Sanity: the loss is finite and differentiable.
+    h = flat.clone().requires_grad_(True)
+    loss = with_slope(preds_for(h), targets)
+    loss.backward()
+    assert torch.isfinite(loss) and h.grad is not None and torch.any(h.grad != 0)
+
+
+def test_verify_coordinate_purity_matches_export_path() -> None:
+    """`export/export_onnx.py:verify_coordinate_purity` is the check that runs against the real
+    exported model; it must stay exact under the Phase 2 halo and the new seed-aware signature."""
+    from mc_imagine_model.export.export_onnx import verify_coordinate_purity
+
+    model = ImagineNet(SMALL_CONFIG)
+    model.eval()
+    assert verify_coordinate_purity(model, seed=12345) == 0.0
+    assert verify_coordinate_purity(model, seed=-8756019554883095434) == 0.0

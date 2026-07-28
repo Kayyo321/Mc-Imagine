@@ -1,0 +1,55 @@
+# Training configuration — Apple Silicon / MPS (this Mac). Smoke tests and short sanity runs.
+#
+# This is the "does it run at all" config: small batch, single-process data loading, no AMP. The
+# real runs happen on the CUDA box with config.cuda.yaml, which shares an IDENTICAL `model:` block
+# — the two files must only ever differ in how the machine is driven, never in what is trained, or
+# a checkpoint trained on one and exported from the other would silently mismatch.
+#
+#   python -m mc_imagine_model.training.train \
+#     --config model/src/mc_imagine_model/training/config.mps.yaml --max-steps 50
+
+model:
+  checkpoint_dir: null  # null -> PromptEncoder uses its own absolute default (model/checkpoints/all-MiniLM-L6-v2), independent of cwd
+  halo: 6
+  patch: 16
+  conv_channels: 192
+  num_conv_layers: 6
+  fusion_hidden: 512
+  fusion_out: 256
+  seed_freqs: 32
+  seed_embed_dim: 64
+  num_profiles: 8
+  num_biomes: 12  # Phase 2 palette: +badlands/eroded_badlands/stony_peaks/beach (spec_constants.NUM_BIOMES)
+
+training:
+  batch_size: 64
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  num_epochs: 15
+  warmup_steps: 200
+  grad_clip_norm: 1.0
+  terrain_weight: 1.0
+  biome_weight: 1.0
+  slope_weight: 1.0  # weight of TerrainLoss's finite-difference slope term (Phase 2 slope-aware loss)
+  checkpoint_dir: "training_runs/mps_run1"  # relative paths resolve against model/ (see train.resolve_path)
+  resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
+  log_every: 50
+  val_every_epochs: 1
+  qualitative_dump_every_epochs: 1
+  target_range_check_batches: 4  # startup assert: all height/water targets inside the head's band
+  seed: 1234
+
+data:
+  data_dir: "data"
+  chunks_per_region: 100
+  max_prompt_length: 128
+  augmentation: false  # see data/labeler.py's maybe_paraphrase — documented no-op, no LLM API available
+  val_region_fraction: 0.08
+  shard_cache_size: null  # null -> cache the whole split in RAM (see train.py's sizing note)
+
+hardware:
+  device: "mps"
+  num_workers: 0    # MPS + fork-based workers deadlock on some torch builds; keep in-process
+  pin_memory: false # meaningless off CUDA
+  prefetch_factor: 2  # only consulted when num_workers > 0; kept so both configs list the same keys
+  mixed_precision: false  # AMP is CUDA-only in this project — MPS autocast is not reliable here

@@ -6,6 +6,13 @@ per-epoch qualitative PNG dump and by the Phase 5 gate script that renders the 6
 Rendering more than one chunk here is purely for a legible PNG (a single 16x16 chunk is a tiny
 image); it also happens to be a convenient way to eyeball docs/poc-plan.md §1b's border-continuity
 property before ever touching ONNX export.
+
+Note that every chunk in a rendered tile shares one `seed`, which is what makes the assembled image
+meaningful: since Phase 2 the seed selects a *translation of the canonical noise field*
+(docs/phase2-plan.md §1a, applied in `model/positional.py`'s CoordinateEncoder), so mixing seeds
+across the tile would stitch together fragments of different worlds. Rendering the same prompt at
+two seeds should produce two different-but-similar-in-character heightfields; rendering it twice at
+one seed must produce bit-identical output.
 """
 
 from typing import Tuple

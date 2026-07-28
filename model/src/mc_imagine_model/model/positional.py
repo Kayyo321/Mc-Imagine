@@ -2,14 +2,23 @@
 Coordinate/positional encoding module.
 
 `CoordinateEncoder` is the concrete mechanism behind docs/poc-plan.md §1b's seamless-chunk-border
-guarantee: it is a **pure, deterministic function of global block coordinates** (no learned
-parameters at all), evaluated over a `(16+2R)x(16+2R)` grid built from `chunk_x`/`chunk_z`. Because
-two neighboring chunks' overlapping/adjacent global coordinates always produce bit-identical
-Fourier features regardless of which chunk "owns" them, and the downstream conv stack
-(`model/imagine_net.py`) uses valid-padding only (no zero-padding), the network's output for a
+guarantee: it is a **pure, deterministic function of (global block coordinates, world seed)** (no
+learned parameters at all), evaluated over a `(16+2R)x(16+2R)` grid built from `chunk_x`/`chunk_z`.
+Because two neighboring chunks' overlapping/adjacent global coordinates always produce bit-identical
+Fourier features regardless of which chunk "owns" them (at a fixed seed), and the downstream conv
+stack (`model/imagine_net.py`) uses valid-padding only (no zero-padding), the network's output for a
 border column is a pure function of that column's global coordinate — never a function of which
 16x16 tile it happened to be requested as part of. That is what makes chunk borders seamless by
 construction rather than by hoping a shared macro-region graph patches things up.
+
+Phase 2 (docs/phase2-plan.md §1a) added the *seed offset* to that pure function. The data generator
+no longer reseeds its Perlin gradient table per macro-region — it samples one canonical noise field
+at `global_coord + seed_to_offset(world_seed)`. The offset therefore has to be applied to the
+coordinates *before* Fourier encoding here too, otherwise the network would have to invert a hash to
+recover which translation of the field it is being asked for (exactly the unlearnable situation §0
+diagnosed). `seed_to_offset_torch` below is the torch mirror of
+`spec_constants.seed_to_offset`, and MUST stay bit-identical to it: it is what ties the exported
+ONNX graph to the coordinate frame the training targets were rendered in.
 
 `SeedEncoder` maps the world seed to a fixed sinusoidal feature bank (again fully deterministic,
 no learned frequencies/phases) followed by a single learned `Linear(32 -> 64)` projection. Unlike
@@ -21,55 +30,105 @@ docs/poc-plan.md calls for.
 """
 
 import math
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+
+from mc_imagine_model.spec_constants import (
+    OFFSET_RANGE,
+    SEED_FOLD,
+    SEED_HASH_MOD,
+    SEED_MIX,
+)
 
 # Wavelengths lambda in {2048 ... 8} halving each octave -> 9 octaves -> 4 features/octave
 # (sin_x, cos_x, sin_z, cos_z) = 36 channels total, per docs/poc-plan.md Phase 5.
 DEFAULT_WAVELENGTHS = (2048.0, 1024.0, 512.0, 256.0, 128.0, 64.0, 32.0, 16.0, 8.0)
 
 
+def seed_to_offset_torch(seed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch mirror of `spec_constants.seed_to_offset`, batched and ONNX-exportable.
+
+    Args:
+        seed (torch.Tensor): [B] world seeds (any integer dtype; cast to int64 internally).
+
+    Returns:
+        tuple: `(offset_x, offset_z)`, each [B] float32, each an exact integer in
+        [0, `spec_constants.OFFSET_RANGE`) — currently [0, 2048), which is `WORLD_PERIOD` and hence
+        exactly one period of this encoder's Fourier features. Offsets beyond one period alias onto
+        positions the encoder cannot distinguish, so a wider range would add no variety while
+        creating conflicting training targets (see spec_constants' WORLD_PERIOD note).
+
+    This MUST agree bit-for-bit with the Python reference for every int64 seed, because
+    `data/world_generator.py` uses the Python version to decide *where in the canonical noise field*
+    a world's training targets were rendered. Any disagreement here would silently train the network
+    against a translated copy of its own input coordinates — the worst kind of bug, since nothing
+    would crash and the loss would merely fail to go down as far as it should.
+
+    Three implementation details are load-bearing and deliberately not "simplified":
+
+    1. **Everything stays int64 until the very last cast.** The largest intermediate is
+       `(SEED_FOLD - 1) * SEED_MIX` ~= 2.66e15, comfortably inside int64's 9.22e18 and — critically —
+       *outside* float32's 2**24 exact-integer range. Doing any step of this in float32 rounds the
+       product and produces a different, plausible-looking offset. The final results are
+       < `OFFSET_RANGE` (2048), far inside 2**24, so the float32 cast at the end is exact.
+    2. **`torch.remainder`, never `torch.fmod`.** `remainder` follows Python/numpy sign semantics
+       (result takes the divisor's sign); `fmod` follows C (result takes the dividend's sign). World
+       seeds are routinely negative, and `-7 % 5` is `3` in Python but `-2` in C — so `fmod` would
+       diverge from the reference on exactly the seeds users type in.
+    3. **`torch.div(..., rounding_mode="floor")`** for the `//`, matching Python's floor division.
+       (`h` is non-negative here so truncation would coincide, but spelling it out keeps the mirror
+       obviously correct rather than incidentally correct.)
+    """
+    s64 = seed.to(torch.int64)
+    s = torch.remainder(s64, SEED_FOLD)
+    h = torch.remainder(s * SEED_MIX, SEED_HASH_MOD)
+    ox = torch.remainder(h, OFFSET_RANGE)
+    oz = torch.remainder(torch.div(h, OFFSET_RANGE, rounding_mode="floor"), OFFSET_RANGE)
+    return ox.to(torch.float32), oz.to(torch.float32)
+
+
 class CoordinateEncoder(nn.Module):
     """
     Encodes a `(16+2*halo) x (16+2*halo)` grid of **global block** `(X, Z)` coordinates — built from
-    `chunk_x`/`chunk_z` (chunk coordinates, each block-scale = chunk coordinate * 16) — into
-    multi-octave Fourier features. Output channel order is `[sin_x, cos_x, sin_z, cos_z]` repeated
-    once per wavelength octave (36 channels for the default 9 octaves).
+    `chunk_x`/`chunk_z` (chunk coordinates, each block-scale = chunk coordinate * 16) and translated
+    by the per-world seed offset (`seed_to_offset_torch`) — into multi-octave Fourier features.
+    Output channel order is `[sin_x, cos_x, sin_z, cos_z]` repeated once per wavelength octave
+    (36 channels for the default 9 octaves).
+
+    Still parameter-free and still a pure function of its inputs; the seed simply widened those
+    inputs from "global coordinate" to "global coordinate, world seed". Seamlessness is unaffected:
+    at a fixed seed, two chunks asking about the same global coordinate get bit-identical features,
+    which is the property `export/export_onnx.py:verify_coordinate_purity` asserts exactly.
     """
 
     def __init__(self, halo: int = 4, patch: int = 16, wavelengths=DEFAULT_WAVELENGTHS) -> None:
         super().__init__()
         self.halo = halo
         self.patch = patch
-        self.size = patch + 2 * halo  # 24 for halo=4, patch=16
+        self.size = patch + 2 * halo  # 28 for halo=6, patch=16 (Phase 2); 24 for halo=4 (Day 1)
         freqs = torch.tensor([2.0 * math.pi / w for w in wavelengths], dtype=torch.float32)
         self.register_buffer("freqs", freqs, persistent=False)  # [num_octaves]
-        # Local block offsets within/around the chunk: -halo .. patch+halo-1 (24 values for halo=4).
+        # Local block offsets within/around the chunk: -halo .. patch+halo-1 (28 values for halo=6).
         offsets = torch.arange(-halo, patch + halo, dtype=torch.float32)
         self.register_buffer("offsets", offsets, persistent=False)  # [size]
         self.out_channels = 4 * len(wavelengths)  # 36
 
-    def forward(self, chunk_x: torch.Tensor, chunk_z: torch.Tensor) -> torch.Tensor:
-        """
+    def _fourier(self, global_x: torch.Tensor, global_z: torch.Tensor) -> torch.Tensor:
+        """Multi-octave Fourier features of already-offset global coordinates.
+
+        Split out from `forward` so the coordinate frame (chunk -> global -> seed-translated) and
+        the encoding itself can be tested independently: a test can hand this raw global
+        coordinates and check that `forward` agrees for the coordinates it claims to be encoding.
+
         Args:
-            chunk_x (torch.Tensor): [B] chunk X coordinates (int or float).
-            chunk_z (torch.Tensor): [B] chunk Z coordinates.
+            global_x/global_z: broadcastable tensors of global block coordinates, `[B, Z, X]`.
 
         Returns:
-            torch.Tensor: [B, out_channels, size, size] Fourier feature grid, `[z][x]` spatial
-                axis order (dim -2 is Z, dim -1 is X) matching docs/model-spec.md's pinned
-                `heightmap`/`block_volume` axis order.
+            torch.Tensor: `[B, 4*num_octaves, Z, X]`, channels ordered
+                `[sin_x, cos_x, sin_z, cos_z]` per octave.
         """
-        b = chunk_x.shape[0]
-        gx0 = (chunk_x.to(torch.float32) * self.patch).view(b, 1, 1)
-        gz0 = (chunk_z.to(torch.float32) * self.patch).view(b, 1, 1)
-
-        x_row = self.offsets.view(1, 1, self.size)  # varies along last dim (X)
-        z_col = self.offsets.view(1, self.size, 1)  # varies along middle dim (Z)
-        global_x = (gx0 + x_row).expand(b, self.size, self.size)  # [B, size(z), size(x)]
-        global_z = (gz0 + z_col).expand(b, self.size, self.size)
-
         feats = []
         num_octaves = self.freqs.shape[0]
         for i in range(num_octaves):
@@ -78,7 +137,38 @@ class CoordinateEncoder(nn.Module):
             feats.append(torch.cos(global_x * f))
             feats.append(torch.sin(global_z * f))
             feats.append(torch.cos(global_z * f))
-        return torch.stack(feats, dim=1)  # [B, 4*num_octaves, size, size]
+        return torch.stack(feats, dim=1)  # [B, 4*num_octaves, Z, X]
+
+    def forward(self, chunk_x: torch.Tensor, chunk_z: torch.Tensor, seed: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            chunk_x (torch.Tensor): [B] chunk X coordinates (int or float).
+            chunk_z (torch.Tensor): [B] chunk Z coordinates.
+            seed (torch.Tensor): [B] world seeds (int64) — translates the canonical field per
+                docs/phase2-plan.md §1a.
+
+        Returns:
+            torch.Tensor: [B, out_channels, size, size] Fourier feature grid, `[z][x]` spatial
+                axis order (dim -2 is Z, dim -1 is X) matching docs/model-spec.md's pinned
+                `heightmap`/`block_volume` axis order.
+        """
+        b = chunk_x.shape[0]
+        # The int64 hash is evaluated on CPU for the same reason SeedEncoder evaluates its float64
+        # phase on CPU: MPS's int64 support is partial, and this is B scalars of work, so keeping it
+        # off the accelerator costs nothing. Device moves are traced away by the ONNX exporter, so
+        # the exported graph still computes the offset in-graph.
+        off_x, off_z = seed_to_offset_torch(seed.detach().to("cpu"))
+        off_x = off_x.to(self.freqs.device).view(b, 1, 1)
+        off_z = off_z.to(self.freqs.device).view(b, 1, 1)
+
+        gx0 = (chunk_x.to(torch.float32) * self.patch).view(b, 1, 1) + off_x
+        gz0 = (chunk_z.to(torch.float32) * self.patch).view(b, 1, 1) + off_z
+
+        x_row = self.offsets.view(1, 1, self.size)  # varies along last dim (X)
+        z_col = self.offsets.view(1, self.size, 1)  # varies along middle dim (Z)
+        global_x = (gx0 + x_row).expand(b, self.size, self.size)  # [B, size(z), size(x)]
+        global_z = (gz0 + z_col).expand(b, self.size, self.size)
+        return self._fourier(global_x, global_z)
 
 
 class SeedEncoder(nn.Module):

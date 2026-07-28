@@ -7,18 +7,32 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from mc_imagine_model.spec_constants import NUM_BIOMES, NUM_PROFILES
+from mc_imagine_model.spec_constants import (
+    HEIGHT_AMPLITUDE,
+    HEIGHT_CENTER,
+    NUM_BIOMES,
+    NUM_PROFILES,
+)
 
 
 class TerrainHead(nn.Module):
     """
     Output head for terrain generation. Per docs/poc-plan.md Phase 5, this predicts (from the
     decoder's final 16x16 feature map, `in_channels` deep):
-      - heightmap: 1 channel, squashed to `63 + 96*tanh(x)` (build-height range [-33, 159], a sane
-        band within Minecraft's [-64, 319] world height that leaves headroom above/below);
+      - heightmap: 1 channel, squashed to `HEIGHT_CENTER + HEIGHT_AMPLITUDE*tanh(x)`;
       - column-profile logits: `num_profiles` channels (8 by default — see spec_constants.py);
-      - per-column water level: 1 channel, same `63 + 96*tanh(x)` squashing as heightmap since both
-        are Y-coordinates.
+      - per-column water level: 1 channel, squashed identically since it is also a Y-coordinate.
+
+    **Why the constants come from `spec_constants` and are never written literally here**
+    (docs/phase2-plan.md §0/§1b): Day 1 hardcoded `63 + 96*tanh(x)`, a hard ceiling of 159, while
+    `data/world_generator.py` rendered terrain up to 235 and 14% of regions exceeded 159. The head
+    physically could not represent its own targets, so it pinned at the ceiling — where tanh's
+    gradient is ~0 — and *every* local variation died with it: the "towering snow-capped peaks"
+    prompt came out at height 158.84-158.98, std 0.03. Flat. The range is now
+    `[HEIGHT_MIN, HEIGHT_MAX]` = [-96, 288], the generator clips into a strictly narrower band
+    ([TERRAIN_CLIP_MIN, TERRAIN_CLIP_MAX]) so no target ever sits at the asymptote, and both facts
+    are asserted at training startup. Sharing one definition is what keeps those three places from
+    drifting apart again.
 
     `block_volume` is *not* predicted here — see `data/dataset.py`'s docstring and
     `export/export_onnx.py`: it's a deterministic `torch.where`-style expansion of
@@ -40,9 +54,9 @@ class TerrainHead(nn.Module):
             tuple: (heightmap [B,16,16] float, profile_logits [B,num_profiles,16,16] float,
                     water_level [B,16,16] float)
         """
-        heightmap = 63.0 + 96.0 * torch.tanh(self.height_conv(features).squeeze(1))
+        heightmap = HEIGHT_CENTER + HEIGHT_AMPLITUDE * torch.tanh(self.height_conv(features).squeeze(1))
         profile_logits = self.profile_conv(features)
-        water_level = 63.0 + 96.0 * torch.tanh(self.water_conv(features).squeeze(1))
+        water_level = HEIGHT_CENTER + HEIGHT_AMPLITUDE * torch.tanh(self.water_conv(features).squeeze(1))
         return heightmap, profile_logits, water_level
 
 

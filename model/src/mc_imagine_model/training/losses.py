@@ -7,15 +7,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict
 
+from mc_imagine_model.spec_constants import HEIGHT_LOSS_SCALE, SLOPE_LOSS_SCALE
+
 
 class TerrainLoss(nn.Module):
     """
-    Combines heightmap regression, column-profile classification, and water-level regression —
-    the three tensors `TerrainHead` (model/heads.py) actually predicts for this tier. Per
-    docs/poc-plan.md: "TerrainLoss = MSE(heightmap) + CrossEntropy(profile)"; the water-level MSE
-    term is added on top of that literal definition since `TerrainHead` also predicts a per-column
-    water level and it needs real supervision to be useful (rather than training on nothing), at a
-    modest weight so it doesn't dominate the heightmap signal.
+    Combines heightmap regression, heightmap *slope* regression, column-profile classification, and
+    water-level regression — supervising the three tensors `TerrainHead` (model/heads.py) actually
+    predicts for this tier. Per docs/poc-plan.md: "TerrainLoss = MSE(heightmap) +
+    CrossEntropy(profile)"; the water-level MSE term is added on top of that literal definition since
+    `TerrainHead` also predicts a per-column water level and it needs real supervision to be useful
+    (rather than training on nothing), at a modest weight so it doesn't dominate the heightmap
+    signal. The slope term is the docs/phase2-plan.md Phase 2 addition described below.
 
     Expects `preds` to contain "heightmap" [B,16,16], "profile_logits" [B,num_profiles,16,16],
     "water_level" [B,16,16]; `targets` to contain "heightmap" [B,16,16] float, "profile_id"
@@ -23,28 +26,77 @@ class TerrainLoss(nn.Module):
     data/dataset.py, which stores one water_level scalar per macro-region).
     """
 
-    # TerrainHead squashes heightmap/water_level to 63 + 96*tanh(x) (raw block units). Raw MSE in
-    # that space is O(10^2-10^3) while profile CrossEntropy over 8 classes is bounded ~O(1-2), so
-    # unnormalized height MSE swamps the combined gradient by 2+ orders of magnitude — in practice
-    # this starves the profile classifier (it collapses to the majority class for anything but the
-    # most distinctive prompts) and biases the height regressor toward matching the coarse mean
-    # first, at the expense of local relief shape. Dividing by HEIGHT_SCALE**2 (the head's own tanh
-    # amplitude) brings height/water error back to the same O(1) scale as the classification terms
-    # before the loss weights combine them.
-    HEIGHT_SCALE = 96.0
+    # Raw height MSE is O(10^2-10^3) in block units while cross-entropy over 8-12 classes is O(1-2),
+    # so the terms must be normalized before they are summed. The scale matters enormously and is
+    # easy to get wrong in a way that looks principled: normalizing by the head's own tanh amplitude
+    # (192) was measured to leave terrain contributing 0.052 against biome's 2.48 — a 48x imbalance
+    # under which training optimizes classification and ignores terrain shape entirely.
+    #
+    # HEIGHT_SCALE is therefore a typical terrain *deviation*, and SLOPE_SCALE a typical per-block
+    # *step* (~1 block by definition) — normalizing a block-to-block gradient by 192 shrank the slope
+    # term to ~2.7e-5, i.e. the relief term this class exists for was doing nothing. Both come from
+    # spec_constants, where the measurements behind them are recorded.
+    HEIGHT_SCALE = HEIGHT_LOSS_SCALE
+    SLOPE_SCALE = SLOPE_LOSS_SCALE
 
-    def __init__(self, water_weight: float = 0.25) -> None:
+    def __init__(self, water_weight: float = 0.25, slope_weight: float = 1.0) -> None:
+        """
+        Args:
+            water_weight: weight of the per-column water-level MSE.
+            slope_weight: weight of the finite-difference slope MSE, relative to the (identically
+                normalized) absolute-height MSE. 1.0 means "care about getting the shape right
+                exactly as much as getting the elevation right".
+        """
         super().__init__()
         self.mse = nn.MSELoss()
         self.ce = nn.CrossEntropyLoss()
         self.water_weight = water_weight
+        self.slope_weight = slope_weight
+
+    @staticmethod
+    def _slopes(height: torch.Tensor) -> tuple:
+        """First-order finite differences of a [B,16,16] `[z][x]` heightmap along x and along z.
+
+        Returns `(d_x [B,16,15], d_z [B,15,16])`. Deliberately plain forward differences rather than
+        a Sobel/conv filter: no padding is involved, so this introduces no border artifacts and
+        nothing has to be excluded from the mean.
+        """
+        d_x = height[:, :, 1:] - height[:, :, :-1]   # last dim is X
+        d_z = height[:, 1:, :] - height[:, :-1, :]   # middle dim is Z
+        return d_x, d_z
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        height_loss = self.mse(preds["heightmap"] / self.HEIGHT_SCALE, targets["heightmap"] / self.HEIGHT_SCALE)
+        pred_h = preds["heightmap"] / self.HEIGHT_SCALE
+        target_h = targets["heightmap"] / self.HEIGHT_SCALE
+
+        height_loss = self.mse(pred_h, target_h)
+
+        # --- slope / gradient term (docs/phase2-plan.md Phase 2) -------------------------------
+        # Absolute-height MSE alone is exactly what let the Day-1 model win by being *smooth*: a
+        # flat surface at the correct conditional mean height is a strong local optimum for MSE,
+        # and measured output std was 0.02-3.73 against ground-truth per-chunk std up to 8.75. A
+        # flat prediction can be near-optimal on height while being *maximally* wrong on slope, so
+        # supervising the finite differences directly prices in relief that absolute error barely
+        # notices, and closes off the smooth-but-correct-mean solution.
+        #
+        # Slopes are normalized by SLOPE_SCALE (~1 block per block), NOT by HEIGHT_SCALE: a
+        # block-to-block step is a fundamentally different quantity from an absolute elevation, and
+        # measuring this term under the old height normalization put it at ~2.7e-5 — three orders of
+        # magnitude below the cross-entropies, so the relief supervision was inert. Computed on raw
+        # block units so `slope_weight` is a meaningful knob.
+        pred_dx, pred_dz = self._slopes(preds["heightmap"] / self.SLOPE_SCALE)
+        target_dx, target_dz = self._slopes(targets["heightmap"] / self.SLOPE_SCALE)
+        slope_loss = 0.5 * (self.mse(pred_dx, target_dx) + self.mse(pred_dz, target_dz))
+
         profile_loss = self.ce(preds["profile_logits"], targets["profile_id"])
         target_water = targets["water_level"].view(-1, 1, 1).expand_as(preds["water_level"])
         water_loss = self.mse(preds["water_level"] / self.HEIGHT_SCALE, target_water / self.HEIGHT_SCALE)
-        return height_loss + profile_loss + self.water_weight * water_loss
+        return (
+            height_loss
+            + self.slope_weight * slope_loss
+            + profile_loss
+            + self.water_weight * water_loss
+        )
 
 
 class BiomeLoss(nn.Module):
@@ -141,9 +193,10 @@ class CombinedLoss(nn.Module):
         biome_weight: float = 1.0,
         structure_weight: float = 0.0,
         structure_graph_weight: float = 0.0,
+        slope_weight: float = 1.0,
     ) -> None:
         super().__init__()
-        self.terrain_loss = TerrainLoss()
+        self.terrain_loss = TerrainLoss(slope_weight=slope_weight)
         self.biome_loss = BiomeLoss()
         self.structure_loss = StructureLoss()
         self.structure_graph_loss = StructureGraphLoss()

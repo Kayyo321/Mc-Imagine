@@ -341,7 +341,7 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
 
             ChunkOutput output = generateOrGetChunkOutput(chunkX, chunkZ);
             int[] heightmap = validateHeightmap(output.heightmap(), chunkX, chunkZ);
-            int[] blockVolume = validateBlockVolume(output.blockVolume(), heightmap, chunkX, chunkZ);
+            ValidatedVolume volume = validateBlockVolume(output, heightmap, chunkX, chunkZ);
 
             int minBuildHeight = chunk.getMinBuildHeight();
             int maxBuildHeight = chunk.getMaxBuildHeight();
@@ -358,7 +358,8 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
                 for (int x = 0; x < 16; x++) {
                     for (int z = 0; z < 16; z++) {
                         for (int y = minBuildHeight; y < maxBuildHeight; y++) {
-                            BlockState state = resolveBlockState(blockVolume, x, y, z, seaLevel);
+                            BlockState state = resolveBlockState(volume.blockVolume(), x, y, z, seaLevel,
+                                    volume.fromFallback());
 
                             int sectionIndex = chunk.getSectionIndex(y);
                             if (sectionIndex < 0 || sectionIndex >= sections.length) {
@@ -386,17 +387,23 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
 
     /**
      * Resolves the block at a single column position, trusting the (validated) block_volume literally
-     * except for one targeted fallback: a declared-air cell at or below sea level fills with water, matching
-     * vanilla's always-full-to-sea-level ocean convention. A fully spec-conformant trained model already
-     * encodes this in its own block_volume via its export-time Where-based expansion
-     * (docs/model-spec.md); this only matters for {@link FallbackTerrain}'s Java-side synthesis, which only
-     * ever fills up to the surface and leaves everything above as air.
+     * except for one targeted fallback: on a {@link FallbackTerrain}-derived volume, a declared-air cell at
+     * or below sea level fills with water, matching vanilla's always-full-to-sea-level ocean convention.
+     * That synthesis only ever fills up to the surface and leaves everything above as air, so without this
+     * it would produce dry ocean basins.
+     *
+     * <p>A spec-conformant trained model already encodes water in its own block_volume via its export-time
+     * Where-based expansion over its own predicted per-column water level (docs/model-spec.md), so its air
+     * below sea level is authoritative and must be taken literally - applying the override there floods
+     * every valley, cave mouth and canyon floor the model deliberately left dry (docs/phase2-plan.md §2
+     * Phase 1.5).
      */
-    private BlockState resolveBlockState(int[] blockVolume, int localX, int y, int localZ, int seaLevel) {
+    private BlockState resolveBlockState(int[] blockVolume, int localX, int y, int localZ, int seaLevel,
+                                         boolean volumeFromFallback) {
         int yIdx = y - FallbackTerrain.MIN_Y;
         int index = FallbackTerrain.blockVolumeIndex(localX, yIdx, localZ);
         int id = (blockVolume != null && index >= 0 && index < blockVolume.length) ? blockVolume[index] : 0;
-        if (id == 0 && y <= seaLevel) {
+        if (volumeFromFallback && id == 0 && y <= seaLevel) {
             return Blocks.WATER.defaultBlockState();
         }
         return blockPalette.get(id);
@@ -415,7 +422,15 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
         return clamped;
     }
 
-    private int[] validateBlockVolume(int[] raw, int[] heightmap, int chunkX, int chunkZ) {
+    /**
+     * A validated block_volume together with where it came from. The provenance has to travel with the
+     * array because {@link #resolveBlockState} applies the sea-level water fill only to
+     * {@link FallbackTerrain}-synthesized volumes - see that method's javadoc.
+     */
+    private record ValidatedVolume(int[] blockVolume, boolean fromFallback) {}
+
+    private ValidatedVolume validateBlockVolume(ChunkOutput output, int[] heightmap, int chunkX, int chunkZ) {
+        int[] raw = output.blockVolume();
         int expectedLength = 16 * FallbackTerrain.HEIGHT_SPAN * 16;
         if (raw == null || raw.length != expectedLength) {
             if (raw != null && raw.length != 0) {
@@ -423,9 +438,9 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
                         "(expected {}); using heightmap-derived fallback volume for this chunk",
                         chunkX, chunkZ, raw.length, expectedLength);
             }
-            return FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap);
+            return new ValidatedVolume(FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap), true);
         }
-        return raw;
+        return new ValidatedVolume(raw, output.blockVolumeFromFallback());
     }
 
     private int clampY(int y) {
@@ -456,7 +471,7 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
 
         ChunkOutput output = generateOrGetChunkOutput(chunkX, chunkZ);
         int[] heightmap = validateHeightmap(output.heightmap(), chunkX, chunkZ);
-        int[] blockVolume = validateBlockVolume(output.blockVolume(), heightmap, chunkX, chunkZ);
+        ValidatedVolume volume = validateBlockVolume(output, heightmap, chunkX, chunkZ);
 
         int minHeight = level.getMinBuildHeight();
         int maxHeight = level.getMaxBuildHeight();
@@ -465,7 +480,7 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
         BlockState[] states = new BlockState[Math.max(0, maxHeight - minHeight)];
         for (int i = 0; i < states.length; i++) {
             int y = minHeight + i;
-            states[i] = resolveBlockState(blockVolume, localX, y, localZ, seaLevel);
+            states[i] = resolveBlockState(volume.blockVolume(), localX, y, localZ, seaLevel, volume.fromFallback());
         }
         return new NoiseColumn(minHeight, states);
     }

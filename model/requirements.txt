@@ -1,13 +1,56 @@
-torch>=2.0.0
-numpy>=1.24.0
-scipy>=1.11.0
-onnx>=1.14.0
-onnxruntime>=1.15.0
-tqdm>=4.65.0
-pyyaml>=6.0
-pillow>=10.0.0
-matplotlib>=3.7.0
-transformers>=4.40.0
-tokenizers>=0.19.0
-safetensors>=0.4.0
-huggingface_hub>=0.20.0
+# Mc-Imagine model pipeline — pinned to the versions this repo is actually developed and verified
+# against (macOS / Python 3.13 / Apple Silicon, 2026-07-28). Everything except torch is pinned
+# exactly: an unpinned `>=` set is not reproducible, which is one of the handoff blockers in
+# docs/phase2-plan.md §0.
+#
+# This file installs dependencies only — it does NOT put `mc_imagine_model` on the import path, and
+# every documented command is a `python -m mc_imagine_model....` invocation. After installing torch
+# and this file, also install the project itself from the repo root:
+#
+#     pip install -e model/          # (or prefix every command with PYTHONPATH=model/src)
+#
+# ---------------------------------------------------------------------------------------------
+# torch is DELIBERATELY NOT PINNED TO A BUILD. Read this before installing on an NVIDIA machine.
+# ---------------------------------------------------------------------------------------------
+# The correct torch wheel depends on the machine: the default PyPI wheel is CPU-only on Linux and
+# MPS-enabled on macOS, and CUDA builds live on PyTorch's own index, one per CUDA runtime. Hard-
+# pinning a CUDA wheel here would break this Mac; pinning the plain wheel would give the GPU box a
+# CPU-only torch that "works" and trains orders of magnitude slower with no error message. So:
+# install torch explicitly for your machine FIRST, then `pip install -r requirements.txt`.
+#
+#   NVIDIA, CUDA 12.4 runtime:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   NVIDIA, CUDA 12.6 runtime:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu126
+#   NVIDIA, CUDA 12.8 runtime (Blackwell / RTX 50-series need this or newer):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   Apple Silicon (MPS) or CPU-only:
+#     pip install torch
+#
+# Pick the index matching the "CUDA Version" field `nvidia-smi` prints top-right (a driver newer
+# than the wheel's CUDA is fine; older is not). Then verify BEFORE starting a long run — this must
+# print True plus your GPU name; False means pip gave you the CPU wheel and config.cuda.yaml will
+# silently fall back to CPU:
+#
+#   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# Verified locally against torch 2.13.0. Any 2.x with working CUDA should do — the training code
+# uses only stable APIs (torch.amp.GradScaler / torch.autocast).
+torch>=2.4
+
+# --- pinned: identical on every machine ----------------------------------------------------------
+numpy==2.3.2
+scipy==1.18.0
+onnx==1.22.0
+onnxruntime==1.28.0
+tqdm==4.70.0
+PyYAML==6.0.3
+pillow==12.1.1
+matplotlib==3.10.3
+transformers==5.14.1
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface_hub==1.25.1
+
+# --- test/dev (model/tests) ----------------------------------------------------------------------
+pytest==9.1.1

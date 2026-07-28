@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 from mc_imagine_model.data.labeler import ChunkLabeler
 from mc_imagine_model.data.world_generator import CANVAS, HALO_MARGIN, REGION_BLOCKS
+from mc_imagine_model.spec_constants import HEIGHT_MAX, HEIGHT_MIN, NUM_BIOMES
 from mc_imagine_model.tokenizer_utils import MAX_PROMPT_TOKENS, tokenize
 
 CHUNKS_PER_REGION_SIDE = REGION_BLOCKS // 16  # 32
@@ -125,6 +126,21 @@ class McImagineDataset(Dataset):
                 "biome_map": npz["biome_map"],
                 "water_level": float(npz["water_level"]),
             }
+        # Cheap once-per-shard contract check (not per-sample). Phase 2 changed both the biome
+        # palette (8 -> 12 ids) and the height band, so a directory left over from an older
+        # generator would otherwise train silently against out-of-contract targets — exactly the
+        # failure mode docs/phase2-plan.md §1b wants to make impossible. Heights are legitimately
+        # negative now, so this is a two-sided bound, not a floor at 0.
+        biome_max = int(data["biome_map"].max())
+        assert biome_max < NUM_BIOMES, (
+            f"{path}: biome id {biome_max} >= NUM_BIOMES ({NUM_BIOMES}) — stale shard, regenerate "
+            f"with ProceduralWorldSource.generate_shards"
+        )
+        h_min, h_max = float(data["heightfield"].min()), float(data["heightfield"].max())
+        assert HEIGHT_MIN < h_min and h_max < HEIGHT_MAX, (
+            f"{path}: heights [{h_min:.1f}, {h_max:.1f}] fall outside the head's representable band "
+            f"({HEIGHT_MIN}, {HEIGHT_MAX}) — TerrainHead's tanh would saturate on these targets"
+        )
         self._shard_cache[path] = data
         if len(self._shard_cache) > self._shard_cache_size:
             self._shard_cache.popitem(last=False)
@@ -171,11 +187,15 @@ class McImagineDataset(Dataset):
         biome_core = shard["biome_map"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
 
         # biome_grid ground truth at quarter resolution (4x4), majority-vote per 4x4 block.
+        # `minlength=NUM_BIOMES` pins the histogram to the palette rather than to whichever ids
+        # happen to occur in this 4x4 window — behaviourally identical for argmax, but it means the
+        # palette size lives in exactly one place (spec_constants) now that it is 12 and not 8.
+        # Ties break toward the lower biome id, as before.
         biome_quarter = np.zeros((QUARTER, QUARTER), dtype=np.int64)
         for bz in range(QUARTER):
             for bx in range(QUARTER):
                 block = biome_core[bz * 4 : bz * 4 + 4, bx * 4 : bx * 4 + 4]
-                counts = np.bincount(block.reshape(-1).astype(np.int64))
+                counts = np.bincount(block.reshape(-1).astype(np.int64), minlength=NUM_BIOMES)
                 biome_quarter[bz, bx] = int(np.argmax(counts))
 
         water_level = float(shard["water_level"])

@@ -426,7 +426,7 @@ possible graphs.
 ```
 data/        chunk_extractor.py, dataset.py, labeler.py, world_generator.py
 model/       text_encoder.py, positional.py, heads.py, imagine_net.py, macro_net.py (planned)
-training/    losses.py, train.py, config.yaml
+training/    losses.py, train.py, config.cuda.yaml, config.mps.yaml
 export/      export_onnx.py, package_mcim.py
 ```
 
@@ -479,7 +479,7 @@ unit too). Four sourcing strategies map onto the existing stub files:
    *labeling*, not extraction, so it doesn't map to an existing stub — it's a manual authoring workflow that
    feeds into `McImagineDataset` in the same tensor format as the other three sources.
 4. **Caption paraphrasing** — an LLM-generated paraphrase pass over captions from (1)/(2), configured via
-   `config.yaml`'s `data.augmentation` flag, so the model learns to generalize prompt language instead of
+   the training config's `data.augmentation` flag, so the model learns to generalize prompt language instead of
    pattern-matching literal keywords from templated captions.
 
 `McImagineDataset.__getitem__` (`data/dataset.py`) is the convergence point — its returned dict already
@@ -506,7 +506,7 @@ position + stochastic variation), and per-tensor output heads (`model/heads.py`:
 `training/losses.py` already has the right shape — `TerrainLoss`, `BiomeLoss`, `StructureLoss`,
 `StructureGraphLoss` combined by weight in `CombinedLoss` — and needs a `MacroFieldLoss` (regression over
 `region_heightfield` + classification over `flavor_zone_ids`/weights) once `macro_net.py` exists.
-`training/train.py` and `training/config.yaml` wire dataset → model → loss → optimizer; `export/export_onnx.py`
+`training/train.py` and `training/config.{cuda,mps}.yaml` wire dataset → model → loss → optimizer; `export/export_onnx.py`
 mirrors `model/generate_dummy_model.py`'s already-working `torch.onnx.export` call (same `input_names`/
 `output_names` convention), just against a real checkpoint instead of a stub `nn.Linear` — and now needs to
 export up to three separate graphs (`model.onnx`, `macro.onnx`, `detail.onnx`) per training run instead of one.

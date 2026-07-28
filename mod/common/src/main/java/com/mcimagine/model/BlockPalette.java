@@ -26,12 +26,24 @@ public class BlockPalette {
 
     public BlockPalette(List<String> paletteIds) {
         List<BlockState> states = new ArrayList<>();
-        // Raw block_volume id 0 is always air (docs/model-spec.md) - this is implicit and NOT itself an
-        // entry in capabilities.block_palette. The manifest's list only enumerates ids 1..N, e.g. the
-        // reference model's ["minecraft:stone", "minecraft:dirt", "minecraft:grass_block"] means
-        // id 1 = stone, id 2 = dirt, id 3 = grass_block (matching the historical hardcoded switch this
-        // class replaces), not id 0 = stone.
-        states.add(Blocks.AIR.defaultBlockState());
+        // Raw block_volume id 0 is always air (docs/model-spec.md). Two manifest conventions exist in the
+        // wild for expressing that, and getting them confused shifts *every* id by one:
+        //
+        //  - Explicit (what the trained exporter writes, and what model/spec_constants.py's BLOCK_PALETTE
+        //    is): the list itself starts with "minecraft:air", so it is already 0-indexed and is used
+        //    verbatim - id 1 = bedrock, id 2 = stone, ...
+        //  - Implicit (docs/model-spec.md's worked example and the legacy dummy-test-v1 fixture): air is
+        //    omitted and the list enumerates ids 1..N only, e.g.
+        //    ["minecraft:stone", "minecraft:dirt", "minecraft:grass_block"] means id 1 = stone.
+        //
+        // Prepending air unconditionally would map a spec-conformant model's id 1 (bedrock) to air, id 2
+        // (stone) to bedrock, and so on - which is exactly the "bedrock floor mid-world" the Day-1 PoC
+        // showed. Detect the explicit form and don't double up.
+        boolean declaresAirAtZero = paletteIds != null && !paletteIds.isEmpty()
+                && "minecraft:air".equals(paletteIds.get(0));
+        if (!declaresAirAtZero) {
+            states.add(Blocks.AIR.defaultBlockState());
+        }
         if (paletteIds != null) {
             for (String id : paletteIds) {
                 states.add(resolveBlock(id));

@@ -121,14 +121,19 @@ public class ModelSession implements AutoCloseable {
                     }
                 }
 
+                // A legacy/heightmap-only graph gets a Java-synthesized volume, which fills only up to
+                // the surface - the consumer has to flood it below sea level itself, so flag it as
+                // fallback-derived (see ChunkOutput#blockVolumeFromFallback).
+                boolean volumeFromFallback = false;
                 if (blockVolume.length == 0 && heightmap.length > 0) {
                     blockVolume = FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap);
+                    volumeFromFallback = true;
                 }
                 if (biomeGrid.length == 0) {
                     biomeGrid = new int[4 * 96 * 4];
                 }
 
-                return new ChunkOutput(heightmap, blockVolume, biomeGrid, structureMarkers);
+                return new ChunkOutput(heightmap, blockVolume, biomeGrid, structureMarkers, volumeFromFallback);
             }
         } finally {
             for (OnnxTensor tensor : inputs.values()) {

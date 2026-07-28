@@ -384,7 +384,8 @@ Mc-Imagine/
 │   │   │   └── heads.py             # Output heads (terrain, biome, etc.)
 │   │   ├── training/                # Training scripts
 │   │   │   ├── train.py
-│   │   │   ├── config.yaml
+│   │   │   ├── config.cuda.yaml
+│   │   │   ├── config.mps.yaml
 │   │   │   └── losses.py            # Custom loss functions
 │   │   └── export/                  # ONNX export & .mcim packaging
 │   │       ├── export_onnx.py

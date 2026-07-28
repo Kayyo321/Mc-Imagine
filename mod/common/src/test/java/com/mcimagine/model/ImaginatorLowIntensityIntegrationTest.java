@@ -1,13 +1,21 @@
 package com.mcimagine.model;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.mcimagine.api.ModelInfo;
 import com.mcimagine.prompt.PromptTokenizer;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -36,6 +44,13 @@ public class ImaginatorLowIntensityIntegrationTest {
 
     private static final String MODEL_FILE = "imaginator-low_intensity-no_structures-1.0.0.mcim";
 
+    /**
+     * Phase 2 grew {@code capabilities.biome_palette} from 8 to 12 entries (docs/phase2-plan.md §2
+     * Phase 1.4) and simultaneously re-ranged the terrain head, so a {@code .mcim} declaring fewer than
+     * this was trained against the old data contract entirely.
+     */
+    private static final int PHASE2_BIOME_PALETTE_SIZE = 12;
+
     private static Path findModelsDir() {
         Path[] candidates = new Path[]{
                 Paths.get("fabric/run/mcimagine/models"),
@@ -51,10 +66,59 @@ public class ImaginatorLowIntensityIntegrationTest {
         return null;
     }
 
+    /**
+     * Gate for every test in this class.
+     *
+     * <p>These assertions describe the <em>current-generation</em> model: its palette sizes, its height
+     * band, and how far apart two prompts must land. Phase 2 invalidates the Day-1 {@code .mcim} by design
+     * (docs/phase2-plan.md: "Phases 1-2 change the data contract... the Day-1 .mcim is invalidated by
+     * design"), and that file is only replaced once retraining happens on the CUDA box. Failing here would
+     * report a stale artefact as a Java defect, so the tests are skipped instead - via
+     * {@link Assumptions#assumeTrue}, so they resurrect automatically the moment a retrained
+     * {@code .mcim} is dropped into the models directory, with no code change and no risk of the coverage
+     * being quietly deleted in the meantime.
+     *
+     * <p>The palette size is read straight out of the archive's {@code manifest.json} rather than through
+     * {@code ModelLoader}, which would run a full 86 MB ONNX load plus trial inference just to decide
+     * whether to skip.
+     */
+    private static Path requireCurrentGenerationModel() {
+        Path modelsDir = findModelsDir();
+        Assumptions.assumeTrue(modelsDir != null,
+                MODEL_FILE + " is not present - run the export/package step to enable this test");
+
+        int declaredBiomes = declaredBiomePaletteSize(modelsDir.resolve(MODEL_FILE));
+        Assumptions.assumeTrue(declaredBiomes >= PHASE2_BIOME_PALETTE_SIZE,
+                MODEL_FILE + " declares a " + declaredBiomes + "-entry biome_palette; this is the stale Day-1 "
+                        + "artefact, which Phase 2's data-contract change invalidates. Retrain and re-export "
+                        + "(>= " + PHASE2_BIOME_PALETTE_SIZE + " biomes) and this test runs again automatically.");
+        return modelsDir;
+    }
+
+    /** Reads {@code capabilities.biome_palette}'s length from a {@code .mcim}, or {@code -1} if unreadable. */
+    private static int declaredBiomePaletteSize(Path mcimPath) {
+        try (ZipFile zip = new ZipFile(mcimPath.toFile())) {
+            ZipEntry manifest = zip.getEntry("manifest.json");
+            if (manifest == null) {
+                return -1;
+            }
+            try (InputStream is = zip.getInputStream(manifest);
+                 InputStreamReader reader = new InputStreamReader(is, StandardCharsets.UTF_8)) {
+                JsonObject root = JsonParser.parseReader(reader).getAsJsonObject();
+                if (!root.has("capabilities")) {
+                    return -1;
+                }
+                JsonObject caps = root.getAsJsonObject("capabilities");
+                return caps.has("biome_palette") ? caps.getAsJsonArray("biome_palette").size() : -1;
+            }
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     @Test
     public void trainedModelLoadsAndPassesTrialInference() {
-        Path modelsDir = findModelsDir();
-        assertNotNull(modelsDir, MODEL_FILE + " not found - run the Phase 6 export/package step first");
+        Path modelsDir = requireCurrentGenerationModel();
 
         ModelLoader loader = new ModelLoader(modelsDir);
         List<ModelInfo> models = loader.discoverModels();
@@ -74,14 +138,20 @@ public class ImaginatorLowIntensityIntegrationTest {
         assertEquals(0, caps.detailPasses());
         assertEquals(128, caps.maxPromptTokens());
         assertEquals(13, caps.blockPalette().size(), "block_palette should have 13 entries (air + 12 real blocks)");
-        assertEquals(8, caps.biomePalette().size(), "biome_palette should have 8 entries per the spec worked example");
         assertTrue(caps.blockPalette().get(0).equals("minecraft:air"), "index 0 of block_palette must be air");
+
+        // Phase 2 (docs/phase2-plan.md §2 Phase 1.4) added badlands/eroded_badlands/stony_peaks/beach so
+        // mesa terrain stops labelling itself savanna and attracting vanilla savanna lake decoration.
+        assertTrue(caps.biomePalette().size() >= PHASE2_BIOME_PALETTE_SIZE,
+                "biome_palette should have at least " + PHASE2_BIOME_PALETTE_SIZE + " entries, got " + caps.biomePalette().size());
+        assertTrue(caps.biomePalette().containsAll(List.of("minecraft:badlands", "minecraft:eroded_badlands",
+                        "minecraft:stony_peaks", "minecraft:beach")),
+                "biome_palette must carry the four Phase 2 additions: " + caps.biomePalette());
     }
 
     @Test
     public void samePromptSameSeedProducesIdenticalOutput() throws Exception {
-        Path modelsDir = findModelsDir();
-        assertNotNull(modelsDir, MODEL_FILE + " not found");
+        Path modelsDir = requireCurrentGenerationModel();
         Path mcimPath = modelsDir.resolve(MODEL_FILE);
 
         ModelLoader loader = new ModelLoader(modelsDir);
@@ -111,8 +181,7 @@ public class ImaginatorLowIntensityIntegrationTest {
 
     @Test
     public void differentPromptsProduceMeaningfullyDifferentTerrain() throws Exception {
-        Path modelsDir = findModelsDir();
-        assertNotNull(modelsDir, MODEL_FILE + " not found");
+        Path modelsDir = requireCurrentGenerationModel();
         Path mcimPath = modelsDir.resolve(MODEL_FILE);
 
         ModelLoader loader = new ModelLoader(modelsDir);
@@ -140,8 +209,7 @@ public class ImaginatorLowIntensityIntegrationTest {
 
     @Test
     public void differentSeedsProduceDifferentOutputForSamePrompt() throws Exception {
-        Path modelsDir = findModelsDir();
-        assertNotNull(modelsDir, MODEL_FILE + " not found");
+        Path modelsDir = requireCurrentGenerationModel();
         Path mcimPath = modelsDir.resolve(MODEL_FILE);
 
         ModelLoader loader = new ModelLoader(modelsDir);

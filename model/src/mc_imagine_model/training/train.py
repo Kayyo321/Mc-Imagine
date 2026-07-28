@@ -1,15 +1,26 @@
 """
 Training script for the Mc-Imagine model (imaginator-low_intensity-no_structures, docs/poc-plan.md
-Phase 5).
+Phase 5; portability work per docs/phase2-plan.md Phase 4).
+
+This script is expected to run unchanged on three devices — MPS (this Mac, smoke tests), CUDA (the
+GPU box that does the real runs) and CPU (fallback/CI) — selected purely by the config file. The
+device-specific machinery is confined to four places, all guarded so the non-CUDA paths are exact
+no-ops: AMP autocast, the gradient scaler, `pin_memory`, and CUDA RNG seeding. AMP is deliberately
+*not* enabled on MPS: autocast there is not reliable for this workload, and a silently-wrong dtype
+is worse than a slower run.
 """
 
 import argparse
+import glob
 import logging
 import math
 import os
+import random
 import time
-from typing import Any, Dict, List
+from contextlib import nullcontext
+from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -18,15 +29,48 @@ from torch.utils.data import DataLoader
 from mc_imagine_model.data.dataset import McImagineDataset
 from mc_imagine_model.inference_utils import render_area
 from mc_imagine_model.model.imagine_net import ImagineNet
-from mc_imagine_model.spec_constants import GATE_PROMPTS, GATE_SEED
+from mc_imagine_model.spec_constants import (
+    GATE_PROMPTS,
+    GATE_SEED,
+    HEIGHT_MAX,
+    HEIGHT_MIN,
+)
 from mc_imagine_model.training.losses import CombinedLoss
 from mc_imagine_model.viz import save_prompt_grid
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+_PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../mc_imagine_model
+MODEL_ROOT = os.path.dirname(os.path.dirname(_PACKAGE_DIR))                 # .../model
+
+
+def resolve_path(path: str) -> str:
+    """Resolves a config path against cwd first, then against `model/`.
+
+    Config files are referenced from the repo root (`python -m mc_imagine_model.training.train
+    --config model/src/.../config.cuda.yaml`) but their `data_dir`/`checkpoint_dir` values are
+    naturally written relative to `model/`. Trying both means the same config works from either
+    working directory instead of silently pointing at an empty dataset.
+    """
+    if os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    candidate = os.path.join(MODEL_ROOT, path)
+    if os.path.exists(candidate):
+        return candidate
+    # Nothing exists yet (e.g. a fresh checkpoint_dir): anchor it under model/ rather than cwd.
+    return candidate
+
 
 def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     if requested == "mps" and torch.backends.mps.is_available():
         return torch.device("mps")
     if requested == "cuda" and torch.cuda.is_available():
@@ -36,6 +80,31 @@ def resolve_device(requested: str) -> torch.device:
     if requested in ("mps", "cuda"):
         logger.warning("%s requested but not available, falling back to cpu", requested)
     return torch.device("cpu")
+
+
+def seed_everything(seed: int) -> torch.Generator:
+    """Seeds python/numpy/torch identically on every device.
+
+    `torch.manual_seed` alone leaves numpy and the DataLoader's shuffling generator unseeded on some
+    paths, so two machines drew different sample orders and their loss curves were not comparable.
+    The returned generator is handed to the DataLoader so shuffling is reproducible too, and CUDA's
+    RNG is seeded only when CUDA exists (a no-op guard, not a device-specific behaviour change).
+    """
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    """Gives every DataLoader worker a distinct-but-deterministic seed (num_workers>0 on CUDA)."""
+    base = torch.initial_seed() % (2**32)
+    np.random.seed((base + worker_id) % (2**32))
+    random.seed(base + worker_id)
 
 
 def make_lr_lambda(warmup_steps: int, total_steps: int):
@@ -50,10 +119,12 @@ def make_lr_lambda(warmup_steps: int, total_steps: int):
 
 
 def split_shards_by_region(data_dir: str, val_fraction: float, seed: int = 0):
-    import glob
-    import random
-
     shard_paths = sorted(glob.glob(os.path.join(data_dir, "region_*.npz")))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No region_*.npz shards found in {data_dir}. Generate the dataset first:\n"
+            "  python -m mc_imagine_model.scripts.generate_data --regions 8000 --out model/data"
+        )
     rng = random.Random(seed)
     shuffled = shard_paths[:]
     rng.shuffle(shuffled)
@@ -63,11 +134,11 @@ def split_shards_by_region(data_dir: str, val_fraction: float, seed: int = 0):
     return train_paths, val_paths
 
 
-def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+def move_batch(batch: Dict[str, Any], device: torch.device, non_blocking: bool = False) -> Dict[str, Any]:
     out = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
-            out[k] = v.to(device)
+            out[k] = v.to(device, non_blocking=non_blocking)
         else:
             out[k] = v
     return out
@@ -82,6 +153,51 @@ def build_targets(batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     }
 
 
+def assert_targets_representable(loader: DataLoader, num_batches: int = 4) -> None:
+    """Fails loudly if any height/water target falls outside what `TerrainHead` can output.
+
+    Day 1 trained against a generator that produced terrain up to y=235 while the head was
+    `63 + 96*tanh(x)` — a hard ceiling of 159. 14% of regions were unrepresentable, tanh saturated,
+    the gradient went to zero and *all* local relief died: the "towering snow-capped peaks" prompt
+    came out with height std 0.03. Nothing crashed and no loss looked obviously wrong; it just
+    quietly trained a flat world. This check is the tripwire for that entire class of bug, so it
+    runs before a single optimizer step and raises rather than warns.
+    """
+    lo, hi = float(HEIGHT_MIN), float(HEIGHT_MAX)
+    seen = 0
+    obs_min, obs_max = float("inf"), float("-inf")
+    for i, batch in enumerate(loader):
+        if i >= num_batches:
+            break
+        for key in ("heightmap", "water_level"):
+            t = batch[key]
+            if not isinstance(t, torch.Tensor):
+                continue
+            t = t.to(torch.float32)
+            tmin, tmax = float(t.min()), float(t.max())
+            obs_min, obs_max = min(obs_min, tmin), max(obs_max, tmax)
+            if tmin < lo or tmax > hi:
+                bad = int(((t < lo) | (t > hi)).sum())
+                raise ValueError(
+                    f"TARGET RANGE CHECK FAILED: '{key}' in batch {i} has {bad} value(s) outside "
+                    f"the model head's representable band [{lo}, {hi}] "
+                    f"(observed min={tmin:.2f}, max={tmax:.2f}).\n"
+                    "The head squashes height as HEIGHT_CENTER + HEIGHT_AMPLITUDE*tanh(x), so any "
+                    "target beyond that band can never be reached: tanh saturates, gradients "
+                    "vanish, and the model trains to a flat world without any error being raised "
+                    "(this is exactly the Day-1 bug, docs/phase2-plan.md §0).\n"
+                    "Fix the data range (data/world_generator.py's TERRAIN_CLIP_MIN/MAX) or widen "
+                    "HEIGHT_CENTER/HEIGHT_AMPLITUDE in spec_constants.py — do not disable this check."
+                )
+        seen += 1
+    if seen == 0:
+        raise ValueError("Target range check could not read a single batch — is the dataset empty?")
+    logger.info(
+        "Target range check passed over %d batch(es): targets in [%.2f, %.2f], head band [%.1f, %.1f].",
+        seen, obs_min, obs_max, lo, hi,
+    )
+
+
 def qualitative_dump(model: nn.Module, device: torch.device, out_path: str, chunk_span: int = 8) -> None:
     was_training = model.training
     model.eval()
@@ -94,16 +210,83 @@ def qualitative_dump(model: nn.Module, device: torch.device, out_path: str, chun
         model.train()
 
 
-def train(config: Dict[str, Any], max_steps: int = None) -> None:
-    torch.manual_seed(config["training"].get("seed", 1234))
+def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, scaler,
+                    config: Dict[str, Any], epoch: int, global_step: int,
+                    val_loss: float, best_val_loss: float) -> None:
+    """Saves *everything* needed to resume, not just the weights.
 
-    device = resolve_device(config["hardware"].get("device", "auto"))
-    logger.info("Using device: %s", device)
+    A multi-hour GPU run that dies at hour 3 must not have to start over, and `export_onnx.py` only
+    ever reads `model_state_dict`/`config`, so the extra keys are additive and backwards compatible.
+    """
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+            "config": config,
+            "epoch": epoch,
+            "global_step": global_step,
+            "val_loss": val_loss,
+            "best_val_loss": best_val_loss,
+        },
+        path,
+    )
 
+
+def load_checkpoint(path: str, model: nn.Module, optimizer, scheduler, scaler,
+                    device: torch.device) -> Tuple[int, int, float]:
+    """Restores model/optimizer/scheduler/scaler state; returns (start_epoch, global_step, best_val_loss)."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"--resume checkpoint not found: {path}")
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    if ckpt.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    else:
+        logger.warning("Checkpoint has no optimizer state — resuming with a fresh optimizer.")
+    if ckpt.get("scheduler_state_dict") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    else:
+        logger.warning("Checkpoint has no scheduler state — LR schedule restarts from step 0.")
+    if scaler is not None and ckpt.get("scaler_state_dict") is not None:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    start_epoch = int(ckpt.get("epoch", -1)) + 1
+    global_step = int(ckpt.get("global_step", 0))
+    best_val_loss = float(ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf"))))
+    logger.info(
+        "Resumed from %s — starting at epoch %d, global_step %d, best_val_loss %.4f",
+        path, start_epoch, global_step, best_val_loss,
+    )
+    return start_epoch, global_step, best_val_loss
+
+
+def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optional[str] = None) -> None:
+    train_cfg = config["training"]
     data_cfg = config["data"]
+    hw_cfg = config.get("hardware", {})
+
+    seed = train_cfg.get("seed", 1234)
+    loader_generator = seed_everything(seed)
+
+    device = resolve_device(hw_cfg.get("device", "auto"))
+    is_cuda = device.type == "cuda"
+    # AMP is CUDA-only by policy: MPS autocast is unreliable for this workload and CPU autocast buys
+    # nothing here. `use_amp` False makes autocast/GradScaler exact no-ops (see below).
+    use_amp = bool(hw_cfg.get("mixed_precision", False)) and is_cuda
+    if hw_cfg.get("mixed_precision", False) and not is_cuda:
+        logger.warning(
+            "mixed_precision requested but device is %s — AMP is CUDA-only here, running in fp32.",
+            device.type,
+        )
+    logger.info("Using device: %s (amp=%s)", device, use_amp)
+    if is_cuda:
+        logger.info("CUDA device: %s", torch.cuda.get_device_name(0))
+
+    data_dir = resolve_path(data_cfg["data_dir"])
+    logger.info("Data dir: %s", data_dir)
     train_paths, val_paths = split_shards_by_region(
-        data_cfg["data_dir"], data_cfg.get("val_region_fraction", 0.08),
-        seed=config["training"].get("seed", 1234),
+        data_dir, data_cfg.get("val_region_fraction", 0.08), seed=seed,
     )
     logger.info("Regions: %d train, %d val", len(train_paths), len(val_paths))
 
@@ -112,30 +295,55 @@ def train(config: Dict[str, Any], max_steps: int = None) -> None:
     # a cache smaller than the shard count causes near-100%-miss thrashing (every batch re-decompresses
     # ~64 distinct gzip'd .npz files). Sizing it to the full split means each shard is decompressed
     # exactly once (ever, not once per epoch) and held resident — a few GB, safely within RAM budget.
+    # Note: with num_workers>0 each worker holds its own copy of that cache, so shard_cache_size is
+    # capped by config to keep total RSS bounded on the GPU box.
+    cache_cap = data_cfg.get("shard_cache_size", None)
+
+    def _cache_size(n_paths: int) -> int:
+        want = max(32, n_paths)
+        return min(want, cache_cap) if cache_cap else want
+
     train_ds = McImagineDataset(
-        data_cfg["data_dir"], shard_paths=train_paths,
+        data_dir, shard_paths=train_paths,
         chunks_per_region=data_cfg.get("chunks_per_region", 100),
         max_tokens=data_cfg.get("max_prompt_length", 128), index_seed=1,
-        shard_cache_size=max(32, len(train_paths)),
+        shard_cache_size=_cache_size(len(train_paths)),
     )
     val_ds = McImagineDataset(
-        data_cfg["data_dir"], shard_paths=val_paths,
+        data_dir, shard_paths=val_paths,
         chunks_per_region=data_cfg.get("chunks_per_region", 100),
         max_tokens=data_cfg.get("max_prompt_length", 128), index_seed=2,
-        shard_cache_size=max(32, len(val_paths)),
+        shard_cache_size=_cache_size(len(val_paths)),
     )
     logger.info("Samples: %d train, %d val", len(train_ds), len(val_ds))
 
-    train_cfg = config["training"]
     batch_size = train_cfg.get("batch_size", 64)
-    num_workers = config["hardware"].get("num_workers", 0)
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        drop_last=True, persistent_workers=(num_workers > 0),
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+    num_workers = int(hw_cfg.get("num_workers", 0))
+    # pin_memory only means anything for CUDA host->device copies; on MPS/CPU it is wasted work
+    # (and on some MPS builds it warns), so it is ANDed with the device rather than passed through.
+    pin_memory = bool(hw_cfg.get("pin_memory", False)) and is_cuda
+    loader_kwargs: Dict[str, Any] = dict(
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(hw_cfg.get("prefetch_factor", 2))
+    logger.info(
+        "DataLoader: batch_size=%d num_workers=%d pin_memory=%s", batch_size, num_workers, pin_memory
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+        generator=loader_generator, **loader_kwargs,
+    )
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
+
+    # Startup tripwire — must run before any optimizer step (see the function's docstring).
+    check_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    assert_targets_representable(
+        check_loader, num_batches=int(train_cfg.get("target_range_check_batches", 4))
     )
 
     model = ImagineNet(config["model"]).to(device)
@@ -148,7 +356,13 @@ def train(config: Dict[str, Any], max_steps: int = None) -> None:
         trainable_params, lr=train_cfg.get("learning_rate", 3e-4),
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
-    criterion = CombinedLoss(structure_weight=0.0, structure_graph_weight=0.0)
+    criterion = CombinedLoss(
+        terrain_weight=train_cfg.get("terrain_weight", 1.0),
+        biome_weight=train_cfg.get("biome_weight", 1.0),
+        slope_weight=train_cfg.get("slope_weight", 1.0),
+        structure_weight=0.0,
+        structure_graph_weight=0.0,
+    )
 
     num_epochs = train_cfg.get("num_epochs", 10)
     steps_per_epoch = len(train_loader)
@@ -157,28 +371,49 @@ def train(config: Dict[str, Any], max_steps: int = None) -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, make_lr_lambda(warmup_steps, total_steps)
     )
+    # enabled=False makes this a documented pass-through: scale()/step()/update() become plain
+    # forwarding calls, so the identical loop body runs on MPS and CPU with no branching.
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    grad_clip = train_cfg.get("grad_clip_norm", 0.0)
 
-    checkpoint_dir = train_cfg.get("checkpoint_dir", "./checkpoints")
+    checkpoint_dir = resolve_path(train_cfg.get("checkpoint_dir", "./checkpoints"))
     os.makedirs(checkpoint_dir, exist_ok=True)
+    logger.info("Checkpoint dir: %s", checkpoint_dir)
 
+    start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
+    resume_path = resume or train_cfg.get("resume") or None
+    if resume_path:
+        start_epoch, global_step, best_val_loss = load_checkpoint(
+            resolve_path(resume_path), model, optimizer, scheduler, scaler, device
+        )
+
     t_start = time.time()
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         epoch_t0 = time.time()
         running_loss = 0.0
         running_count = 0
         for step, batch in enumerate(train_loader):
-            batch = move_batch(batch, device)
-            preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
-            targets = build_targets(batch)
-            loss = criterion(preds, targets)
+            batch = move_batch(batch, device, non_blocking=pin_memory)
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                if use_amp else nullcontext()
+            )
+            with autocast_ctx:
+                preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
+                targets = build_targets(batch)
+                loss = criterion(preds, targets)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             running_loss += loss.item()
@@ -200,29 +435,38 @@ def train(config: Dict[str, Any], max_steps: int = None) -> None:
         epoch_time = time.time() - epoch_t0
         logger.info("=== epoch %d done: train_loss=%.4f, time=%.1fs ===", epoch, train_loss, epoch_time)
 
+        val_loss = float("nan")
         if (epoch + 1) % train_cfg.get("val_every_epochs", 1) == 0:
             model.eval()
             val_loss_total = 0.0
             val_count = 0
             with torch.no_grad():
                 for batch in val_loader:
-                    batch = move_batch(batch, device)
-                    preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
-                    targets = build_targets(batch)
-                    loss = criterion(preds, targets)
+                    batch = move_batch(batch, device, non_blocking=pin_memory)
+                    autocast_ctx = (
+                        torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                        if use_amp else nullcontext()
+                    )
+                    with autocast_ctx:
+                        preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
+                        targets = build_targets(batch)
+                        loss = criterion(preds, targets)
                     val_loss_total += loss.item()
                     val_count += 1
             val_loss = val_loss_total / max(1, val_count)
             logger.info("=== epoch %d val_loss=%.4f ===", epoch, val_loss)
 
             ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
-            torch.save({"model_state_dict": model.state_dict(), "config": config, "epoch": epoch,
-                        "val_loss": val_loss}, ckpt_path)
+            save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, config,
+                            epoch, global_step, val_loss, best_val_loss)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save({"model_state_dict": model.state_dict(), "config": config, "epoch": epoch,
-                            "val_loss": val_loss}, os.path.join(checkpoint_dir, "best.pt"))
+                save_checkpoint(os.path.join(checkpoint_dir, "best.pt"), model, optimizer,
+                                scheduler, scaler, config, epoch, global_step, val_loss, best_val_loss)
                 logger.info("New best checkpoint (val_loss=%.4f) saved.", val_loss)
+            # `last.pt` is what --resume wants after a crash, independent of which epoch was best.
+            save_checkpoint(os.path.join(checkpoint_dir, "last.pt"), model, optimizer, scheduler,
+                            scaler, config, epoch, global_step, val_loss, best_val_loss)
 
         if (epoch + 1) % train_cfg.get("qualitative_dump_every_epochs", 1) == 0:
             dump_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}_qualitative.png")
@@ -241,15 +485,21 @@ def main() -> None:
     Parses configuration, sets up dataset, model, optimizer, and runs the training loop.
     """
     parser = argparse.ArgumentParser(description="Train the Mc-Imagine model")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to training config")
+    # Required on purpose: there is no longer a single config.yaml, and defaulting to either
+    # config.mps.yaml or config.cuda.yaml would mean one of the two machines silently trains with
+    # the wrong device/AMP/worker settings.
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to training config (training/config.mps.yaml or config.cuda.yaml)")
     parser.add_argument("--max-steps", type=int, default=None, help="Stop after N steps (smoke test)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Checkpoint to resume from (model+optimizer+scheduler+epoch/step)")
     args = parser.parse_args()
 
     print(f"Starting training with config: {args.config}")
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    train(config, max_steps=args.max_steps)
+    train(config, max_steps=args.max_steps, resume=args.resume)
 
 
 if __name__ == "__main__":

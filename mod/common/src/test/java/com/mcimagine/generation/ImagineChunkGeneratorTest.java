@@ -2,6 +2,7 @@ package com.mcimagine.generation;
 
 import com.mcimagine.api.ModelInfo;
 import com.mcimagine.model.ChunkOutput;
+import com.mcimagine.model.FallbackTerrain;
 import com.mcimagine.model.ModelSession;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
@@ -30,6 +31,7 @@ import org.mockito.Mockito;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
@@ -214,5 +216,103 @@ public class ImagineChunkGeneratorTest {
 
         NoiseColumn column = generator.getBaseColumn(10, 10, level, null);
         assertNotNull(column);
+    }
+
+    // --- Sea-level water override (docs/phase2-plan.md §2 Phase 1.5) ---------------------------------
+    // The `air && y <= seaLevel => water` rule is a compensation for FallbackTerrain's Java-side
+    // synthesis, which only ever fills up to the surface. A spec-conformant model bakes water into its
+    // own block_volume in-graph from its own predicted per-column water level (docs/model-spec.md), so
+    // its air below sea level is authoritative - applying the override there floods every deep valley
+    // and dry basin the model deliberately carved. These two tests pin both halves of that.
+
+    private static final LevelHeightAccessor FULL_HEIGHT_LEVEL = new LevelHeightAccessor() {
+        @Override public int getHeight() { return 384; }
+        @Override public int getMinBuildHeight() { return -64; }
+    };
+
+    /** A model-shaped {@code block_volume}: solid up to {@code surfaceY}, air above, nothing else. */
+    private static int[] solidUpTo(int surfaceY) {
+        int[] volume = new int[16 * FallbackTerrain.HEIGHT_SPAN * 16];
+        for (int x = 0; x < 16; x++) {
+            for (int z = 0; z < 16; z++) {
+                for (int y = FallbackTerrain.MIN_Y; y <= surfaceY; y++) {
+                    volume[FallbackTerrain.blockVolumeIndex(x, y - FallbackTerrain.MIN_Y, z)] = 1;
+                }
+            }
+        }
+        return volume;
+    }
+
+    private static ImagineChunkGenerator generatorReturning(ChunkOutput output) throws Exception {
+        ModelSession session = Mockito.mock(ModelSession.class);
+        Mockito.when(session.generateChunk(Mockito.anyInt(), Mockito.anyInt(), Mockito.anyLong(), any()))
+                .thenReturn(output);
+        return new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, session);
+    }
+
+    @Test
+    public void modelSuppliedAirBelowSeaLevelIsNotFloodedWithWater() throws Exception {
+        int surfaceY = 40; // a whole chunk sitting 23 blocks below sea level, deliberately dry
+        int[] heightmap = new int[256];
+        Arrays.fill(heightmap, surfaceY);
+        ChunkOutput modelOutput = new ChunkOutput(heightmap, solidUpTo(surfaceY), new int[4 * 96 * 4], new float[0][0]);
+
+        ImagineChunkGenerator generator = generatorReturning(modelOutput);
+        assertEquals(63, generator.getSeaLevel(), "sanity: overworld sea level is 63");
+
+        NoiseColumn column = generator.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+
+        assertNotEquals(Blocks.AIR.defaultBlockState(), column.getBlock(surfaceY), "sanity: solid terrain at the surface");
+        for (int y = surfaceY + 1; y <= 63; y++) {
+            assertEquals(Blocks.AIR.defaultBlockState(), column.getBlock(y),
+                    "y=" + y + " is air in a model-authored block_volume below sea level and must stay air");
+        }
+    }
+
+    @Test
+    public void fallbackDerivedVolumeStillFillsToSeaLevelWithWater() {
+        // The empty ModelSession routes through FallbackTerrain.generateFallbackChunkOutput, whose
+        // synthesis stops at the surface - without the override its ocean basins would generate dry.
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, new ModelSession());
+        int seaLevel = generator.getSeaLevel();
+        int[] fallbackHeights = FallbackTerrain.generateHeightmap(0, 0);
+
+        int localX = -1;
+        int localZ = -1;
+        for (int x = 0; x < 16 && localX < 0; x++) {
+            for (int z = 0; z < 16; z++) {
+                if (fallbackHeights[z * 16 + x] < seaLevel - 1) {
+                    localX = x;
+                    localZ = z;
+                    break;
+                }
+            }
+        }
+        assertTrue(localX >= 0, "fallback sine terrain should dip below sea level somewhere in chunk (0, 0)");
+
+        int surfaceY = fallbackHeights[localZ * 16 + localX];
+        NoiseColumn column = generator.getBaseColumn(localX, localZ, FULL_HEIGHT_LEVEL, null);
+
+        assertNotEquals(Blocks.WATER.defaultBlockState(), column.getBlock(surfaceY), "the surface block itself stays solid");
+        for (int y = surfaceY + 1; y <= seaLevel; y++) {
+            assertEquals(Blocks.WATER.defaultBlockState(), column.getBlock(y),
+                    "y=" + y + " is above fallback terrain and at/below sea level, so it must be water");
+        }
+        assertEquals(Blocks.AIR.defaultBlockState(), column.getBlock(seaLevel + 1), "nothing above sea level is flooded");
+    }
+
+    @Test
+    public void malformedModelVolumeFallsBackAndRegainsTheWaterFill() throws Exception {
+        // A wrong-length block_volume is replaced by FallbackTerrain.buildBlockVolumeFromHeightmap, so the
+        // provenance flag must flip to "fallback" even though the ChunkOutput itself came from a model.
+        int[] heightmap = new int[256];
+        Arrays.fill(heightmap, 40);
+        ChunkOutput malformed = new ChunkOutput(heightmap, new int[7], new int[4 * 96 * 4], new float[0][0]);
+
+        ImagineChunkGenerator generator = generatorReturning(malformed);
+        NoiseColumn column = generator.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+
+        assertEquals(Blocks.WATER.defaultBlockState(), column.getBlock(50),
+                "a heightmap-derived fallback volume must still be flooded up to sea level");
     }
 }

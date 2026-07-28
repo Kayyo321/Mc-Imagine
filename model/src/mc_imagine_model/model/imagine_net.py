@@ -8,20 +8,27 @@ model/macro_net.py for the separate, per-macro-region MacroFieldNet that models 
 capabilities.requires_macro_field = true also ship — not used by
 `imaginator-low_intensity-no_structures`, the only model this PoC trains.
 
-Architecture (docs/poc-plan.md Phase 5):
+Architecture (docs/poc-plan.md Phase 5, capacity per docs/phase2-plan.md Phase 2):
   1. `PromptEncoder` (frozen MiniLM, text_encoder.py) -> 384-dim prompt embedding.
   2. `SeedEncoder` (positional.py) -> 64-dim seed embedding.
-  3. concat(prompt, seed) -> small MLP -> 128-dim fused conditioning vector.
-  4. `CoordinateEncoder` (positional.py) -> 36-channel Fourier feature grid, (16+2*halo)^2 spatial.
+  3. concat(prompt, seed) -> small MLP -> `FUSION_OUT`-dim fused conditioning vector.
+  4. `CoordinateEncoder` (positional.py) -> 36-channel Fourier feature grid, (16+2*halo)^2 spatial,
+     evaluated at global block coordinates translated by the world seed's offset (§1a).
   5. Broadcast the fused conditioning vector across that grid, concat channel-wise, and run it
-     through 4 valid-padded (no zero-padding) 3x3 conv + GELU layers at 128 channels — each valid
-     conv shrinks the spatial size by 2, so 4 of them take 24x24 -> 16x16 exactly.
-  6. `TerrainHead` / `BiomeHead` (heads.py) consume the final 16x16, 128-channel feature map.
+     through `NUM_CONV_LAYERS` valid-padded (no zero-padding) 3x3 conv + GELU layers at
+     `CONV_CHANNELS` channels — each valid conv shrinks the spatial size by 2, so the stack takes
+     `(patch + 2*halo)^2 -> patch^2` exactly. See the `_check_conv_arithmetic` assertion below.
+  6. `TerrainHead` / `BiomeHead` (heads.py) consume the final 16x16, `CONV_CHANNELS`-deep map.
+
+Day 1 ran this at 4 layers x 128 channels — roughly 800k trainable parameters, which
+docs/phase2-plan.md Phase 2 calls out as "tiny". The defaults below are the Phase 2 scale-up
+(6 layers x 192 channels, halo 6, wider fusion); `training/config*.yaml` sets exactly these keys.
 
 The valid-padding-only conv stack is what makes docs/poc-plan.md §1b's seamless-border guarantee
-hold: since every value in the 24x24 input grid is a pure function of global block coordinate (see
-CoordinateEncoder), and no zero-padding is ever introduced, every value in the 16x16 output is
-*also* a pure function of global coordinate — independent of which chunk requested it.
+hold: since every value in the input halo grid is a pure function of (global block coordinate,
+seed) (see CoordinateEncoder), and no zero-padding is ever introduced, every value in the 16x16
+output is *also* a pure function of global coordinate at a fixed seed — independent of which chunk
+requested it.
 """
 
 from typing import Any, Dict, Optional
@@ -34,12 +41,38 @@ from mc_imagine_model.model.positional import CoordinateEncoder, SeedEncoder
 from mc_imagine_model.model.text_encoder import PromptEncoder
 from mc_imagine_model.spec_constants import NUM_BIOMES, NUM_PROFILES
 
-HALO = 4
+HALO = 6
 PATCH = 16
-CONV_CHANNELS = 128
-FUSION_HIDDEN = 256
-FUSION_OUT = 128
-NUM_CONV_LAYERS = 4  # 24x24 -> 16x16 via 4 valid 3x3 convs (each shrinks by 2)
+CONV_CHANNELS = 192
+FUSION_HIDDEN = 512
+FUSION_OUT = 256
+SEED_FREQS = 32
+SEED_EMBED_DIM = 64
+NUM_CONV_LAYERS = 6  # 28x28 -> 16x16 via 6 valid 3x3 convs (each shrinks by 2)
+
+# Each valid (padding=0) 3x3 conv removes exactly one cell from every side, i.e. 2 from each spatial
+# dimension. The halo therefore has to be *exactly* consumed by the stack.
+CONV_SHRINK_PER_LAYER = 2
+
+
+def _check_conv_arithmetic(halo: int, patch: int, num_conv_layers: int) -> None:
+    """Fails loudly if halo/layer count don't line up, instead of silently emitting the wrong size.
+
+    This is the check that makes `halo`, `patch` and `num_conv_layers` safe to tune from a config
+    file. Get it wrong by one and the model still builds, still trains, and quietly produces a
+    15x15 or 17x17 tile — which then either crashes far downstream in the exporter's `[16,384,16]`
+    reshape or, worse, trains against a misaligned target. `halo` is *not* a free parameter: it is
+    determined by the depth of the valid-padded stack.
+    """
+    size = patch + 2 * halo
+    out = size - CONV_SHRINK_PER_LAYER * num_conv_layers
+    if out != patch:
+        raise ValueError(
+            f"Conv stack arithmetic mismatch: halo={halo}, patch={patch}, "
+            f"num_conv_layers={num_conv_layers} -> input {size}x{size} shrinks to {out}x{out}, "
+            f"but the chunk output must be exactly {patch}x{patch}. Required: "
+            f"halo == num_conv_layers (each valid 3x3 conv consumes one ring of halo)."
+        )
 
 
 class ImagineNet(nn.Module):
@@ -63,11 +96,25 @@ class ImagineNet(nn.Module):
         super().__init__()
         self.config = config
 
+        halo = config.get("halo", HALO)
+        patch = config.get("patch", PATCH)
+        num_conv_layers = config.get("num_conv_layers", NUM_CONV_LAYERS)
+        # Checked before anything is allocated, so a bad config fails at construction with a clear
+        # message rather than at the first forward (or, worse, not at all).
+        _check_conv_arithmetic(halo, patch, num_conv_layers)
+        if patch != PATCH:
+            raise ValueError(
+                f"patch must be {PATCH}: docs/model-spec.md pins model.onnx's heightmap at "
+                f"int32[16,16] and block_volume at int32[16,384,16], and BiomeHead's stride-4 "
+                f"downsample assumes a 16x16 feature map. Got patch={patch}."
+            )
+
         checkpoint_dir = config.get("checkpoint_dir")
         self.text_encoder = PromptEncoder(checkpoint_dir=checkpoint_dir)
-        self.coord_encoder = CoordinateEncoder(halo=config.get("halo", HALO), patch=config.get("patch", PATCH))
+        self.coord_encoder = CoordinateEncoder(halo=halo, patch=patch)
         self.seed_encoder = SeedEncoder(
-            num_freqs=config.get("seed_freqs", 32), embed_dim=config.get("seed_embed_dim", 64)
+            num_freqs=config.get("seed_freqs", SEED_FREQS),
+            embed_dim=config.get("seed_embed_dim", SEED_EMBED_DIM),
         )
 
         prompt_dim = self.text_encoder.embed_dim
@@ -82,7 +129,6 @@ class ImagineNet(nn.Module):
         )
 
         conv_channels = config.get("conv_channels", CONV_CHANNELS)
-        num_conv_layers = config.get("num_conv_layers", NUM_CONV_LAYERS)
         in_ch = fusion_out + self.coord_encoder.out_channels
         layers = []
         c = in_ch
@@ -134,7 +180,11 @@ class ImagineNet(nn.Module):
         seed_emb = self.seed_encoder(seed)  # [B, 64]
         fused = self.fusion(torch.cat([prompt_emb, seed_emb], dim=-1))  # [B, fusion_out]
 
-        coord_feats = self.coord_encoder(chunk_x, chunk_z)  # [B, 36, size, size]
+        # Seed is passed to the coordinate encoder as well as the seed encoder: it translates the
+        # canonical noise field (docs/phase2-plan.md §1a), which is a *coordinate-frame* effect the
+        # Fourier features have to see directly. Feeding it only as a conditioning vector would
+        # require the network to invert the seed hash to recover the translation.
+        coord_feats = self.coord_encoder(chunk_x, chunk_z, seed)  # [B, 36, size, size]
         b, _, h, w = coord_feats.shape
         fused_grid = fused.view(b, -1, 1, 1).expand(b, fused.shape[-1], h, w)
 

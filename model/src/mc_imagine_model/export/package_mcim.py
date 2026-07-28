@@ -17,6 +17,8 @@ import os
 import zipfile
 from typing import Any, Dict, List
 
+from mc_imagine_model.spec_constants import BIOME_PALETTE, BLOCK_PALETTE
+
 
 FORMAT_VERSION = "0.5.0"
 
@@ -55,6 +57,24 @@ def _detail_io() -> Dict[str, List[str]]:
     }
 
 
+def _palette_arg(value: Any, default: List[str]) -> List[str]:
+    """Resolves a palette CLI value to a list, defaulting to `spec_constants`' source of truth.
+
+    Day 1 passed both palettes as long literal `--block_palette`/`--biome_palette` strings typed by
+    hand at the shell. That is precisely how the manifest drifts out of sync with the ids the model
+    actually predicts: when Phase 2 grew the biome palette from 8 to 12 entries, a hand-typed
+    invocation would have kept shipping the 8-entry list and the mod would have mapped every
+    badlands prediction to whatever sat at that index in the stale list — a silent, in-world-only
+    wrongness. Defaulting from `spec_constants` means the manifest tracks the code automatically;
+    the flags remain for deliberate overrides (e.g. packaging an older checkpoint).
+    """
+    if value is None:
+        return list(default)
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [b.strip() for b in str(value).split(",") if b.strip()]
+
+
 def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
     """Builds a manifest.json dict conforming to docs/model-spec.md (format_version 0.5.0)."""
     capabilities: Dict[str, Any] = {
@@ -64,13 +84,12 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         "caves": args.caves,
         "structure_support": args.structure_support,
         "prompt_tags": [t.strip() for t in args.prompt_tags.split(",") if t.strip()],
-        "block_palette": [b.strip() for b in args.block_palette.split(",") if b.strip()],
+        "block_palette": _palette_arg(getattr(args, "block_palette", None), BLOCK_PALETTE),
         "max_prompt_tokens": args.max_prompt_tokens,
         "requires_macro_field": args.requires_macro_field,
         "detail_passes": args.detail_passes,
     }
-    if args.biome_palette:
-        capabilities["biome_palette"] = [b.strip() for b in args.biome_palette.split(",") if b.strip()]
+    capabilities["biome_palette"] = _palette_arg(getattr(args, "biome_palette", None), BIOME_PALETTE)
     if args.structure_support == "intricate":
         capabilities["max_rooms"] = args.max_rooms
         capabilities["template_library_version"] = args.template_library_version
@@ -121,6 +140,38 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def write_mcim(args: argparse.Namespace) -> str:
+    """Builds the manifest and writes the `.mcim` zip. Returns the output path.
+
+    Split out of `main()` so `scripts/build_mcim.py` can produce a package through this exact code
+    path with a synthesized Namespace, instead of maintaining a second copy of the archive layout.
+    """
+    print(f"Packaging {args.onnx_model} into {args.output}")
+
+    manifest = build_manifest(args)
+    caps = manifest["capabilities"]
+    print(f"  block_palette: {len(caps['block_palette'])} entries")
+    print(f"  biome_palette: {len(caps['biome_palette'])} entries")
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(args.output)), "_manifest_tmp.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    try:
+        with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(args.onnx_model, arcname="model.onnx")
+            if args.macro_onnx:
+                zf.write(args.macro_onnx, arcname="macro.onnx")
+            if args.detail_onnx:
+                zf.write(args.detail_onnx, arcname="detail.onnx")
+            zf.write(args.tokenizer, arcname="tokenizer.json")
+            zf.write(manifest_path, arcname="manifest.json")
+    finally:
+        os.remove(manifest_path)
+
+    print(f"Packaging complete: {args.output}")
+    return args.output
+
+
 def main() -> None:
     """
     Main packaging function.
@@ -145,8 +196,12 @@ def main() -> None:
     parser.add_argument("--biomes", action="store_true")
     parser.add_argument("--caves", action="store_true")
     parser.add_argument("--prompt_tags", type=str, default="terrain")
-    parser.add_argument("--block_palette", type=str, default="minecraft:stone,minecraft:dirt,minecraft:grass_block")
-    parser.add_argument("--biome_palette", type=str, default=None, help="Comma-separated namespaced biome ids biome_grid indexes into (0.5.0+)")
+    parser.add_argument("--block_palette", type=str, default=None,
+                        help="Comma-separated namespaced block ids block_volume indexes into. "
+                             f"Default: spec_constants.BLOCK_PALETTE ({len(BLOCK_PALETTE)} entries)")
+    parser.add_argument("--biome_palette", type=str, default=None,
+                        help="Comma-separated namespaced biome ids biome_grid indexes into (0.5.0+). "
+                             f"Default: spec_constants.BIOME_PALETTE ({len(BIOME_PALETTE)} entries)")
     parser.add_argument("--max_prompt_tokens", type=int, default=128)
     parser.add_argument("--max_rooms", type=int, default=12, help="Only used when structure_support=intricate")
     parser.add_argument("--template_library_version", type=str, default="0.1.0", help="Only used when structure_support=intricate")
@@ -163,26 +218,7 @@ def main() -> None:
     if args.requires_macro_field and not args.macro_onnx:
         parser.error("--macro_onnx is required when --requires_macro_field is set")
 
-    print(f"Packaging {args.onnx_model} into {args.output}")
-
-    manifest = build_manifest(args)
-    manifest_path = os.path.join(os.path.dirname(args.output) or ".", "_manifest_tmp.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-    try:
-        with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(args.onnx_model, arcname="model.onnx")
-            if args.macro_onnx:
-                zf.write(args.macro_onnx, arcname="macro.onnx")
-            if args.detail_onnx:
-                zf.write(args.detail_onnx, arcname="detail.onnx")
-            zf.write(args.tokenizer, arcname="tokenizer.json")
-            zf.write(manifest_path, arcname="manifest.json")
-    finally:
-        os.remove(manifest_path)
-
-    print(f"Packaging complete: {args.output}")
+    write_mcim(args)
 
 
 if __name__ == "__main__":

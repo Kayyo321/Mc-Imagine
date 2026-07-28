@@ -8,20 +8,23 @@ version = "0.1.0"
 description = "AI model training pipeline for Mc-Imagine world generation"
 requires-python = ">=3.11"
 license = {text = "GPL-3.0-only"}
+# Kept in lockstep with requirements.txt. torch is deliberately NOT pinned to a specific build here:
+# the correct wheel depends on the target machine's CUDA version, so it must be installed separately
+# on a GPU box (see requirements.txt and docs/TRAINING.md for the --index-url guidance).
 dependencies = [
-    "torch>=2.0",
-    "numpy",
-    "scipy",
-    "onnx",
-    "onnxruntime",
-    "tqdm",
-    "pyyaml",
-    "pillow",
-    "matplotlib",
-    "transformers>=4.40.0",
-    "tokenizers>=0.19.0",
-    "safetensors>=0.4.0",
-    "huggingface_hub>=0.20.0"
+    "torch>=2.4",
+    "numpy==2.3.2",
+    "scipy==1.18.0",
+    "onnx==1.22.0",
+    "onnxruntime==1.28.0",
+    "tqdm==4.70.0",
+    "pyyaml==6.0.3",
+    "pillow==12.1.1",
+    "matplotlib==3.10.3",
+    "transformers==5.14.1",
+    "tokenizers==0.22.2",
+    "safetensors==0.8.0",
+    "huggingface_hub==1.25.1"
 ]
 
 [project.optional-dependencies]
@@ -37,6 +40,12 @@ training = [
     "hydra-core"
 ]
 
+# Note: `dev` installs pytest; the test suite lives in model/tests and is run with
+#   PYTHONPATH=src python3 -m pytest tests/ -q
+
 [project.scripts]
+mc-imagine-bootstrap = "mc_imagine_model.scripts.bootstrap:main"
+mc-imagine-generate-data = "mc_imagine_model.scripts.generate_data:main"
 mc-imagine-train = "mc_imagine_model.training.train:main"
 mc-imagine-export = "mc_imagine_model.export.export_onnx:main"
+mc-imagine-build-mcim = "mc_imagine_model.scripts.build_mcim:main"

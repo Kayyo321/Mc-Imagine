@@ -61,6 +61,6 @@ public final class FallbackTerrain {
     public static ChunkOutput generateFallbackChunkOutput(int chunkX, int chunkZ) {
         int[] heightmap = generateHeightmap(chunkX, chunkZ);
         int[] blockVolume = buildBlockVolumeFromHeightmap(heightmap);
-        return new ChunkOutput(heightmap, blockVolume, new int[4 * 96 * 4], new float[0][0]);
+        return new ChunkOutput(heightmap, blockVolume, new int[4 * 96 * 4], new float[0][0], true);
     }
 }

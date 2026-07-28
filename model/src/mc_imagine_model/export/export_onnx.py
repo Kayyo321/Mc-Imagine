@@ -40,6 +40,8 @@ from mc_imagine_model.spec_constants import (
     AIR_ID,
     BEDROCK_ID,
     DEEPSLATE_ID,
+    HEIGHT_MAX,
+    HEIGHT_MIN,
     NUM_BIOMES,
     NUM_PROFILES,
     PROFILE_TABLE,
@@ -53,6 +55,23 @@ NUM_Y = MAX_Y - MIN_Y + 1  # 384
 CHUNK_SIZE = 16
 QUARTER = 4
 QUARTER_Y = NUM_Y // 4  # 96
+
+# TerrainHead's representable band ([HEIGHT_MIN, HEIGHT_MAX] = [-96, 288] after
+# docs/phase2-plan.md §1b widened it) is deliberately *wider* than Minecraft's world band
+# [MIN_Y, MAX_Y] at the bottom: the head is allowed to want a height below bedrock, and the
+# clamp in ChunkExportWrapper.forward is what makes that safe. Keeping the head's range strictly
+# inside the world band instead would reintroduce the tanh-saturation failure at the low end.
+# What must NOT happen is the head being able to exceed the *top* of the world, which would index
+# the y-grid out of range, so that direction is asserted rather than merely clamped.
+assert HEIGHT_MAX <= MAX_Y, (
+    f"TerrainHead can emit heights up to {HEIGHT_MAX}, above the world ceiling {MAX_Y} — "
+    f"spec_constants.HEIGHT_CENTER/HEIGHT_AMPLITUDE must stay inside the buildable world."
+)
+# Clamp band for the block_volume expansion: leave 5 blocks below for the bedrock floor + the
+# 4-deep subsurface band, and 2 above so `y == h` and the water fill always have room.
+HEIGHT_CLAMP_MIN = MIN_Y + 5
+HEIGHT_CLAMP_MAX = MAX_Y - 2
+assert HEIGHT_MIN <= HEIGHT_CLAMP_MIN, "clamp is pointless if the head cannot reach below it"
 
 
 class ChunkExportWrapper(nn.Module):
@@ -82,8 +101,11 @@ class ChunkExportWrapper(nn.Module):
         water_f = out["water_level"]           # [B,16,16] = [B, z, x]
         biome_logits = out["biome_logits"]     # [B, num_biomes, 4, 4] = [B, C, z_q, x_q]
 
+        # TerrainHead's band ([HEIGHT_MIN, HEIGHT_MAX]) intentionally extends below the world floor,
+        # so this clamp is load-bearing, not defensive: it is what keeps every index into the
+        # 384-tall y-grid valid no matter what the head asks for. See the module-level constants.
         h_round = torch.round(heightmap_f).to(torch.int64)
-        h_round = torch.clamp(h_round, MIN_Y + 5, MAX_Y - 2)  # leave room for bedrock/subsurface/air bands
+        h_round = torch.clamp(h_round, HEIGHT_CLAMP_MIN, HEIGHT_CLAMP_MAX)
         water_round = torch.round(water_f).to(torch.int64)
         water_round = torch.clamp(water_round, MIN_Y + 1, MAX_Y - 1)
         profile_id = torch.argmax(profile_logits, dim=1)  # [B,16,16] = [B,z,x]
@@ -181,13 +203,19 @@ def _run(session: onnxruntime.InferenceSession, prompt_ids, chunk_x: int, chunk_
     return dict(zip(names, outputs))
 
 
-def verify_coordinate_purity(net: ImagineNet) -> float:
+def verify_coordinate_purity(net: ImagineNet, seed: int = 12345) -> float:
     """
     The actual, rigorous, exact-equality proof behind docs/poc-plan.md §1b's seamless-border
     guarantee: `CoordinateEncoder` (model/positional.py) is a pure function of global block
-    coordinate, so the region of chunk(0,0)'s halo window that overlaps chunk(1,0)'s halo window
-    (global block x in [12, 19]) must produce bit-identical Fourier features regardless of which
-    chunk's request constructed it.
+    coordinate *at a fixed world seed*, so the region of chunk(0,0)'s halo window that overlaps
+    chunk(1,0)'s halo window must produce bit-identical Fourier features regardless of which chunk's
+    request constructed it.
+
+    Phase 2 (docs/phase2-plan.md §1a) added a seed-derived translation to the coordinate frame, so
+    the check is now run at one fixed seed — which is exactly the right scope: a single generated
+    world only ever has one seed, and the seam guarantee is a within-world property. (Two chunks
+    generated at *different* seeds belong to different worlds and are not expected to agree; that
+    they disagree is verified separately in tests/test_model.py.)
 
     Why this — rather than literally comparing chunk(0,0)'s emitted core column x=15 to
     chunk(1,0)'s emitted core column x=0 — is the correct rigorous check: those two columns are
@@ -203,15 +231,23 @@ def verify_coordinate_purity(net: ImagineNet) -> float:
     Returns the max abs difference (expected to be exactly 0.0, or at most float rounding noise).
     """
     ce = net.coord_encoder
+    seed_t = torch.tensor([seed], dtype=torch.int64)
     with torch.no_grad():
-        f0 = ce(torch.tensor([0]), torch.tensor([0]))  # halo covers global x in [-4, 19]
-        f1 = ce(torch.tensor([1]), torch.tensor([0]))  # halo covers global x in [12, 35]
-    # Overlap: global x in [12, 19] -> local index in f0's 24-wide grid = global+4 -> [16,23];
-    # local index in f1's 24-wide grid = global-12 -> [0,7].
-    f0_shared = f0[0, :, :, 16:24]
-    f1_shared = f1[0, :, :, 0:8]
+        f0 = ce(torch.tensor([0]), torch.tensor([0]), seed_t)  # covers global x in [-halo, 15+halo]
+        f1 = ce(torch.tensor([1]), torch.tensor([0]), seed_t)  # covers global x in [16-halo, 31+halo]
+    # The two halo windows overlap on global x in [16-halo, 15+halo], which is `2*halo` columns
+    # wide. In f0's `size`-wide grid those sit at local indices [patch, size); in f1's they sit at
+    # [0, size-patch). Derived from ce.halo/ce.patch rather than hardcoded so this stays correct if
+    # the halo changes (Phase 2 took it from 4 to 6).
+    patch, size = ce.patch, ce.size
+    f0_shared = f0[0, :, :, patch:size]
+    f1_shared = f1[0, :, :, 0:size - patch]
+    assert f0_shared.shape[-1] == 2 * ce.halo, "overlap width must be exactly 2*halo columns"
     diff = (f0_shared - f1_shared).abs().max().item()
-    assert diff < 1e-4, f"CoordinateEncoder is not a pure function of global coordinate: diff={diff}"
+    assert diff == 0.0, (
+        f"CoordinateEncoder is not a bit-exact pure function of (global coordinate, seed): "
+        f"diff={diff}"
+    )
     return diff
 
 
