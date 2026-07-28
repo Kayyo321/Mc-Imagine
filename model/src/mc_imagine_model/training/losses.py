@@ -4,48 +4,78 @@ Custom loss functions for Mc-Imagine model training.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict
 
 
 class TerrainLoss(nn.Module):
     """
-    Combines heightmap MSE and block volume cross-entropy.
+    Combines heightmap regression, column-profile classification, and water-level regression —
+    the three tensors `TerrainHead` (model/heads.py) actually predicts for this tier. Per
+    docs/poc-plan.md: "TerrainLoss = MSE(heightmap) + CrossEntropy(profile)"; the water-level MSE
+    term is added on top of that literal definition since `TerrainHead` also predicts a per-column
+    water level and it needs real supervision to be useful (rather than training on nothing), at a
+    modest weight so it doesn't dominate the heightmap signal.
+
+    Expects `preds` to contain "heightmap" [B,16,16], "profile_logits" [B,num_profiles,16,16],
+    "water_level" [B,16,16]; `targets` to contain "heightmap" [B,16,16] float, "profile_id"
+    [B,16,16] long, "water_level" [B] float (broadcast across all 16x16 columns — see
+    data/dataset.py, which stores one water_level scalar per macro-region).
     """
 
-    def __init__(self) -> None:
+    # TerrainHead squashes heightmap/water_level to 63 + 96*tanh(x) (raw block units). Raw MSE in
+    # that space is O(10^2-10^3) while profile CrossEntropy over 8 classes is bounded ~O(1-2), so
+    # unnormalized height MSE swamps the combined gradient by 2+ orders of magnitude — in practice
+    # this starves the profile classifier (it collapses to the majority class for anything but the
+    # most distinctive prompts) and biases the height regressor toward matching the coarse mean
+    # first, at the expense of local relief shape. Dividing by HEIGHT_SCALE**2 (the head's own tanh
+    # amplitude) brings height/water error back to the same O(1) scale as the classification terms
+    # before the loss weights combine them.
+    HEIGHT_SCALE = 96.0
+
+    def __init__(self, water_weight: float = 0.25) -> None:
         super().__init__()
-        # TODO: Initialize MSELoss and CrossEntropyLoss
+        self.mse = nn.MSELoss()
+        self.ce = nn.CrossEntropyLoss()
+        self.water_weight = water_weight
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # TODO: Compute combined terrain loss
-        return torch.tensor(0.0, requires_grad=True)
+        height_loss = self.mse(preds["heightmap"] / self.HEIGHT_SCALE, targets["heightmap"] / self.HEIGHT_SCALE)
+        profile_loss = self.ce(preds["profile_logits"], targets["profile_id"])
+        target_water = targets["water_level"].view(-1, 1, 1).expand_as(preds["water_level"])
+        water_loss = self.mse(preds["water_level"] / self.HEIGHT_SCALE, target_water / self.HEIGHT_SCALE)
+        return height_loss + profile_loss + self.water_weight * water_loss
 
 
 class BiomeLoss(nn.Module):
     """
-    Cross-entropy loss for biome prediction.
+    Cross-entropy loss for biome prediction, over the quarter-resolution `biome_grid` classes.
+    Expects `preds["biome_logits"]` [B,num_biomes,4,4] and `targets["biome_grid"]` [B,4,4] long.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        # TODO: Initialize CrossEntropyLoss
+        self.ce = nn.CrossEntropyLoss()
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # TODO: Compute biome loss
-        return torch.tensor(0.0, requires_grad=True)
+        return self.ce(preds["biome_logits"], targets["biome_grid"])
 
 
 class StructureLoss(nn.Module):
     """
     Binary cross-entropy + localization loss for structure_markers (structure_support == "basic").
+
+    Not used by this PoC (`imaginator-low_intensity-no_structures` declares
+    `structure_support: "none"`) — left as an explicit stub; `CombinedLoss` below never calls this
+    when `structure_weight == 0` (the default, and the only value this PoC trains with).
     """
 
     def __init__(self) -> None:
         super().__init__()
-        # TODO: Initialize BCEWithLogitsLoss
+        # TODO (out of scope for this PoC): Initialize BCEWithLogitsLoss
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # TODO: Compute structure loss
+        # TODO (out of scope for this PoC): Compute structure loss
         return torch.tensor(0.0, requires_grad=True)
 
 
@@ -58,14 +88,16 @@ class StructureGraphLoss(nn.Module):
     cross-entropy per edge cell, not a regression loss like TerrainLoss. Padding slots
     (room_type_id == 0) should be masked out rather than penalized, since max_rooms is a fixed upper
     bound and most structures won't use all of it.
+
+    Not used by this PoC — see StructureLoss's docstring above.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        # TODO: Initialize masked CrossEntropyLoss for nodes and edges
+        # TODO (out of scope for this PoC): Initialize masked CrossEntropyLoss for nodes and edges
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # TODO: Compute masked structure-graph loss
+        # TODO (out of scope for this PoC): Compute masked structure-graph loss
         return torch.tensor(0.0, requires_grad=True)
 
 
@@ -74,7 +106,7 @@ class MacroFieldLoss(nn.Module):
     Loss for MacroFieldNet (model/macro_net.py), which trains separately from ImagineNet — it's a
     different model operating at macro-region granularity, not one of ImagineNet's heads, so this
     is NOT folded into CombinedLoss below. Only relevant for models with
-    capabilities.requires_macro_field = true.
+    capabilities.requires_macro_field = true — not this PoC's model.
 
     Combines: MSE over region_heightfield (regression, like TerrainLoss), cross-entropy over
     flavor_zone_ids weighted by flavor_zone_weights (categorical + soft blend target), and binary
@@ -85,25 +117,29 @@ class MacroFieldLoss(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        # TODO: Initialize MSELoss (heightfield), CrossEntropyLoss (flavor zones),
-        # BCEWithLogitsLoss (structure candidate flag) + localization loss (offset)
+        # TODO (out of scope for this PoC): Initialize MSELoss (heightfield), CrossEntropyLoss
+        # (flavor zones), BCEWithLogitsLoss (structure candidate flag) + localization loss (offset)
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # TODO: Compute combined macro-field loss
+        # TODO (out of scope for this PoC): Compute combined macro-field loss
         return torch.tensor(0.0, requires_grad=True)
 
 
 class CombinedLoss(nn.Module):
     """
-    Weighted sum of all loss components. structure_graph_weight only contributes when training a
-    structure_support == "intricate" model (see StructureGraphLoss); leave it at 0 for lower tiers.
+    Weighted sum of all loss components. `structure_weight`/`structure_graph_weight` default to
+    `0.0` per docs/poc-plan.md ("structure_weight = structure_graph_weight = 0") since this PoC only
+    trains `structure_support: "none"` models — when both are `0` (the only configuration this PoC
+    ever uses), `StructureLoss`/`StructureGraphLoss` are never even invoked, since `preds` won't
+    contain real `structure_markers`/`structure_graph_*` tensors to feed them (see
+    `model/imagine_net.py`, which returns zeroed placeholders for those keys at this tier).
     """
 
     def __init__(
         self,
         terrain_weight: float = 1.0,
         biome_weight: float = 1.0,
-        structure_weight: float = 1.0,
+        structure_weight: float = 0.0,
         structure_graph_weight: float = 0.0,
     ) -> None:
         super().__init__()
@@ -120,13 +156,10 @@ class CombinedLoss(nn.Module):
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
         loss_t = self.terrain_loss(preds, targets)
         loss_b = self.biome_loss(preds, targets)
-        loss_s = self.structure_loss(preds, targets)
-        loss_sg = self.structure_graph_loss(preds, targets)
+        total_loss = self.terrain_weight * loss_t + self.biome_weight * loss_b
 
-        total_loss = (
-            self.terrain_weight * loss_t +
-            self.biome_weight * loss_b +
-            self.structure_weight * loss_s +
-            self.structure_graph_weight * loss_sg
-        )
+        if self.structure_weight > 0.0:
+            total_loss = total_loss + self.structure_weight * self.structure_loss(preds, targets)
+        if self.structure_graph_weight > 0.0:
+            total_loss = total_loss + self.structure_graph_weight * self.structure_graph_loss(preds, targets)
         return total_loss

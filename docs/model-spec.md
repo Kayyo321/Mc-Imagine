@@ -1,6 +1,6 @@
 # Mc-Imagine Model Format Specification (.mcim)
 
-**Version:** 0.4.0 (Draft)
+**Version:** 0.5.0 (Draft)
 
 ## Overview
 The `.mcim` file format is the standard distributable format for Mc-Imagine world generation models. An
@@ -195,7 +195,8 @@ The manifest provides the mod with essential information about how to load and u
   - `caves`: (Boolean) True if the model generates cave systems.
   - `structure_support`: (String) `"none"`, `"basic"`, or `"intricate"` — see "Capability Tiers" above. Supersedes the old boolean `structures` field; a manifest with `structure_support` omitted is treated as `"none"`.
   - `prompt_tags`: (List of Strings) Semantic tags the model can act on (e.g. `"terrain"`, `"biome_blend"`, `"structures"`, `"loot"`, `"redstone"`). The world-creation UI tags the player's prompt with the same vocabulary and warns/strips any clause whose tag isn't in this list rather than failing outright.
-  - `block_palette`: (List of Strings) Namespaced IDs of blocks the model can output.
+  - `block_palette`: (List of Strings) Namespaced IDs of blocks the model can output, indexed by `block_volume`'s integer ids (index `0` is always air).
+  - `biome_palette`: (List of Strings, added in 0.5.0) Namespaced biome IDs (e.g. `"minecraft:desert"`) that `biome_grid` indexes into — the exact mirror of `block_palette`, for the same integer-id-to-registry-entry resolution. Optional; a manifest omitting it cannot have `biome_grid` consumed by a `BiomeSource` and the mod treats biome assignment as vanilla-default.
   - `max_prompt_tokens`: (Integer) Maximum context length for the text prompt.
   - `requires_macro_field`: (Boolean) Whether this model ships and requires `macro.onnx` for cross-chunk coherence. `false` for the accessible `"low"`/`"none"` tier, which may omit the second graph entirely.
   - `detail_passes`: (Integer) Number of additive decoration passes run after the base call — see "Detail Passes" above. Conventionally `0`/`1`/`2` for `"low"`/`"medium"`/`"high"`.
@@ -240,10 +241,18 @@ Every model must produce the terrain tensors. Structure tensors are additive and
 `structure_support` tier the manifest declares — a `"none"` model omits both; a `"basic"` model adds
 `structure_markers`; an `"intricate"` model adds the three `structure_graph_*` tensors instead.
 
+**Axis order (pinned in 0.5.0 — previously ambiguous):**
+- `heightmap`: indexed `[z][x]` — matches the mod's existing `heightmap[z*16 + x]` read.
+- `block_volume`: indexed `[x][y][z]`, with `y` running from `minY = -64` (index `0`) to `maxY = 319` (index `383`).
+- `biome_grid`: indexed `[x][y][z]` at quarter resolution (one entry per 4×4×4 volume; `y` likewise from `minY`).
+
+A transposed axis order is the most likely silent failure in the whole pipeline — implementations on both
+sides (training export, mod loader) must conform to this exactly, not to whatever felt natural locally.
+
 **All tiers:**
-- `heightmap`: `int32[16, 16]` - Surface elevation for the chunk.
-- `block_volume`: `int32[16, 384, 16]` - 3D grid of block state IDs mapped to the palette.
-- `biome_grid`: `int32[4, 96, 4]` - Biome distribution per 4x4x4 volume.
+- `heightmap`: `int32[16, 16]` - Surface elevation for the chunk. `[z][x]`.
+- `block_volume`: `int32[16, 384, 16]` - 3D grid of block state IDs mapped to `capabilities.block_palette`. `[x][y][z]`.
+- `biome_grid`: `int32[4, 96, 4]` - Biome distribution per 4x4x4 volume, mapped to `capabilities.biome_palette`. `[x][y][z]` at quarter resolution.
 
 **`structure_support: "basic"` only:**
 - `structure_markers`: `float32[N, 5]` - List of potential single-piece structures (type_id, x, y, z, probability). Each marker stamps one hand-authored NBT template (a ruin, a shrine) at the given position — no internal composition.
@@ -290,10 +299,27 @@ only ever reference ids that exist in the library version it was trained against
 compatibility the same way `format_version` is checked today.
 
 ## Tokenizer Format
-`tokenizer.json` follows the standard HuggingFace Tokenizers format, providing vocabulary, merges, and normalization rules needed to convert the player's text prompt into `prompt_tokens`.
+`tokenizer.json` follows the standard HuggingFace Tokenizers format, providing vocabulary, merges, and normalization rules needed to convert the player's text prompt into `prompt_tokens`. For this reference model
+family, `tokenizer.json` is **BERT-family WordPiece**, uncased, matching the MiniLM foundation
+(`docs/model-spec.md` §"Foundation Architecture" / `sentence-transformers/all-MiniLM-L6-v2`'s own tokenizer):
+lowercase + accent-stripped input, greedy longest-match-first subword splitting with `##` continuation
+prefixes, special tokens `[PAD] = 0`, `[CLS] = 101`, `[SEP] = 102`. `prompt_tokens` is
+`[CLS] token... [SEP]` padded with `0` to `max_prompt_tokens`. The mod's Java `PromptTokenizer` and the
+training pipeline's Python tokenizer must both implement this exact scheme — a mismatch here is invisible at
+runtime (no crash, just silently wrong embeddings) and is validated by a golden-vector test (a shared set of
+`(prompt, token_ids)` pairs both implementations must reproduce exactly).
 
 ## Versioning Policy
 Breaking changes to the manifest schema or expected tensor shapes will result in a minor version bump (e.g., 0.3.0 to 0.4.0). The mod will warn players if they attempt to load an incompatible format version.
+
+## Versioning
+- **0.5.0**: Pinned axis order for `heightmap`/`block_volume`/`biome_grid` (previously ambiguous — see
+  "Output Tensors" above); added optional `capabilities.biome_palette`; documented the tokenizer scheme
+  (BERT-family WordPiece) authoritatively rather than leaving it to "standard HuggingFace format" alone.
+  **0.4.0 manifests remain loadable**: every field introduced in 0.5.0 is optional and the loader defaults
+  it (`biome_palette` absent ⇒ `biome_grid` is extracted but not consumed by a `BiomeSource`; axis order was
+  always intended to be as pinned here, so no 0.4.0 manifest's data changes meaning, only the spec's
+  precision about it does).
 
 ---
 
@@ -309,7 +335,7 @@ landforms or spatial style zones the way the high-intensity example below does.
 
 ```json
 {
-  "format_version": "0.4.0",
+  "format_version": "0.5.0",
   "model": {
     "id": "imaginator-low_intensity-no_structures",
     "name": "Imaginator - Low Intensity",
@@ -326,6 +352,7 @@ landforms or spatial style zones the way the high-intensity example below does.
     "structure_support": "none",
     "prompt_tags": ["terrain", "biome_blend"],
     "block_palette": ["minecraft:stone", "minecraft:dirt", "minecraft:grass_block", "minecraft:water", "minecraft:sand"],
+    "biome_palette": ["minecraft:plains", "minecraft:desert", "minecraft:forest", "minecraft:snowy_plains", "minecraft:swamp", "minecraft:savanna", "minecraft:taiga", "minecraft:ocean"],
     "max_prompt_tokens": 128,
     "requires_macro_field": false,
     "detail_passes": 0
@@ -403,7 +430,7 @@ the vault — without altering the room graph itself.
 
 ```json
 {
-  "format_version": "0.4.0",
+  "format_version": "0.5.0",
   "model": {
     "id": "imaginator-high_intensity-intricate_structures",
     "name": "Imaginator - High Intensity / Intricate Structures",
@@ -432,6 +459,7 @@ the vault — without altering the room graph itself.
       { "id": 4, "name": "moonlit_fen", "block_bias": ["minecraft:mud", "minecraft:mangrove_roots", "minecraft:lily_pad", "minecraft:glow_lichen"] }
     ],
     "block_palette": ["minecraft:stone", "minecraft:cobbled_deepslate", "minecraft:mossy_stone_bricks", "minecraft:dirt", "minecraft:grass_block", "minecraft:water"],
+    "biome_palette": ["minecraft:dark_forest", "minecraft:swamp", "minecraft:basalt_deltas", "minecraft:mangrove_swamp"],
     "max_prompt_tokens": 128
   },
   "requirements": {

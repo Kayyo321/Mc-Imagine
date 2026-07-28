@@ -5,14 +5,23 @@ import com.mcimagine.model.ChunkOutput;
 import com.mcimagine.model.ModelSession;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.data.registries.VanillaRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.LevelHeightAccessor;
 import net.minecraft.world.level.NoiseColumn;
+import net.minecraft.world.level.biome.Biomes;
+import net.minecraft.world.level.biome.BiomeSource;
+import net.minecraft.world.level.biome.FixedBiomeSource;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.blending.Blender;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -31,10 +40,25 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 
 public class ImagineChunkGeneratorTest {
 
+    private static Holder<NoiseGeneratorSettings> overworldSettings;
+    private static BiomeSource plainsBiomeSource;
+
+    /**
+     * {@code ImagineChunkGenerator} now requires a real {@code Holder<NoiseGeneratorSettings>} (it
+     * delegates {@code applyCarvers}/{@code buildSurface}/{@code spawnOriginalMobs} to an internal
+     * {@code NoiseBasedChunkGenerator} built from it - see that class's javadoc for why). Offline unit
+     * tests obtain one, with no running server, via {@link VanillaRegistries#createLookup()} - the same
+     * mechanism Minecraft's own datagen uses to bootstrap "world gen" registries.
+     */
     @BeforeAll
     public static void setupMinecraft() {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+
+        HolderLookup.Provider registries = VanillaRegistries.createLookup();
+        overworldSettings = registries.lookupOrThrow(Registries.NOISE_SETTINGS).getOrThrow(NoiseGeneratorSettings.OVERWORLD);
+        Holder<net.minecraft.world.level.biome.Biome> plains = registries.lookupOrThrow(Registries.BIOME).getOrThrow(Biomes.PLAINS);
+        plainsBiomeSource = new FixedBiomeSource(plains);
     }
 
     private Path findDummyModelPath() {
@@ -57,7 +81,7 @@ public class ImagineChunkGeneratorTest {
         Path modelsDir = findDummyModelPath();
         assertNotNull(modelsDir, "dummy-test-v1.mcim directory should be found in workspace");
 
-        ImagineChunkGenerator generator = new ImagineChunkGenerator(null, modelsDir);
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, modelsDir);
         assertTrue(generator.isModelLoaded(), "ImagineChunkGenerator should successfully load model");
 
         ModelInfo info = generator.getModelInfo();
@@ -73,7 +97,7 @@ public class ImagineChunkGeneratorTest {
         Path modelsDir = findDummyModelPath();
         assertNotNull(modelsDir, "dummy-test-v1.mcim directory should be found");
 
-        ImagineChunkGenerator generator = new ImagineChunkGenerator(null, modelsDir);
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, modelsDir);
 
         LevelHeightAccessor level = new LevelHeightAccessor() {
             @Override public int getHeight() { return 384; }
@@ -96,7 +120,7 @@ public class ImagineChunkGeneratorTest {
         Path modelsDir = findDummyModelPath();
         assertNotNull(modelsDir, "dummy-test-v1.mcim directory should be found");
 
-        ImagineChunkGenerator generator = new ImagineChunkGenerator(null, modelsDir);
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, modelsDir);
 
         LevelHeightAccessor level = new LevelHeightAccessor() {
             @Override public int getHeight() { return 384; }
@@ -121,39 +145,62 @@ public class ImagineChunkGeneratorTest {
         Path modelsDir = findDummyModelPath();
         assertNotNull(modelsDir, "dummy-test-v1.mcim directory should be found");
 
-        ImagineChunkGenerator generator = new ImagineChunkGenerator(null, modelsDir);
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, modelsDir);
+
+        // fillFromNoise now writes through LevelChunkSection.acquire()/setBlockState()/release() instead of
+        // 98,304 individual ChunkAccess.setBlockState calls (docs/poc-plan.md Phase 3, bug #2/#4 fixes), so
+        // the mock chunk needs its sections + heightmap-unprimed accessors stubbed rather than setBlockState.
+        int minBuildHeight = -64;
+        int maxBuildHeight = 320;
+        int sectionCount = (maxBuildHeight - minBuildHeight) / 16;
+
+        Map<Integer, BlockState[][][]> sectionWrites = new HashMap<>();
+        LevelChunkSection[] sections = new LevelChunkSection[sectionCount];
+        for (int i = 0; i < sectionCount; i++) {
+            LevelChunkSection section = Mockito.mock(LevelChunkSection.class);
+            BlockState[][][] local = new BlockState[16][16][16];
+            Mockito.when(section.setBlockState(Mockito.anyInt(), Mockito.anyInt(), Mockito.anyInt(), any(BlockState.class), anyBoolean()))
+                    .thenAnswer(invocation -> {
+                        int lx = invocation.getArgument(0);
+                        int ly = invocation.getArgument(1);
+                        int lz = invocation.getArgument(2);
+                        BlockState state = invocation.getArgument(3);
+                        local[lx][ly][lz] = state;
+                        return state;
+                    });
+            sectionWrites.put(i, local);
+            sections[i] = section;
+        }
 
         ChunkAccess mockChunk = Mockito.mock(ChunkAccess.class);
-        Map<BlockPos, BlockState> blockMap = new HashMap<>();
-
         Mockito.when(mockChunk.getPos()).thenReturn(new ChunkPos(1, 2));
-        Mockito.when(mockChunk.getMinBuildHeight()).thenReturn(-64);
-        Mockito.when(mockChunk.getMaxBuildHeight()).thenReturn(320);
-
-        Mockito.when(mockChunk.setBlockState(any(BlockPos.class), any(BlockState.class), anyBoolean()))
-                .thenAnswer(invocation -> {
-                    BlockPos pos = invocation.getArgument(0);
-                    BlockState state = invocation.getArgument(1);
-                    blockMap.put(pos, state);
-                    return state;
-                });
+        Mockito.when(mockChunk.getMinBuildHeight()).thenReturn(minBuildHeight);
+        Mockito.when(mockChunk.getMaxBuildHeight()).thenReturn(maxBuildHeight);
+        Mockito.when(mockChunk.getSections()).thenReturn(sections);
+        Mockito.when(mockChunk.getSectionIndex(Mockito.anyInt()))
+                .thenAnswer(invocation -> ((int) invocation.getArgument(0) - minBuildHeight) >> 4);
+        Mockito.when(mockChunk.getOrCreateHeightmapUnprimed(Heightmap.Types.WORLD_SURFACE_WG))
+                .thenReturn(Mockito.mock(Heightmap.class));
+        Mockito.when(mockChunk.getOrCreateHeightmapUnprimed(Heightmap.Types.OCEAN_FLOOR_WG))
+                .thenReturn(Mockito.mock(Heightmap.class));
 
         Executor directExecutor = Runnable::run;
         ChunkAccess result = generator.fillFromNoise(directExecutor, Blender.empty(), null, null, mockChunk).join();
-
         assertNotNull(result, "Resulting chunk should not be null");
-        assertFalse(blockMap.isEmpty(), "Blocks should be set in chunk by fillFromNoise");
 
         ChunkOutput output = generator.generateOrGetChunkOutput(1, 2);
         int expectedHeight = output.heightmap()[5 * 16 + 5];
-        BlockState topBlock = blockMap.get(new BlockPos(5, expectedHeight, 5));
+        int sectionIndex = (expectedHeight - minBuildHeight) >> 4;
+        int localY = (expectedHeight - minBuildHeight) & 15;
+
+        BlockState topBlock = sectionWrites.get(sectionIndex)[5][localY][5];
         assertNotNull(topBlock, "Top block at local (5, 5) should be set");
         assertEquals(Blocks.GRASS_BLOCK.defaultBlockState(), topBlock, "Top block should be grass block driven by model inference");
     }
 
     @Test
     public void testFallbackChunkGenerationWithoutModel() {
-        ImagineChunkGenerator generator = new ImagineChunkGenerator(null, new ModelSession());
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, new ModelSession());
         assertFalse(generator.isModelLoaded(), "Generator with empty ModelSession should report model not loaded");
 
         LevelHeightAccessor level = new LevelHeightAccessor() {

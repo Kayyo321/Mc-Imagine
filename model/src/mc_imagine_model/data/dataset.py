@@ -2,29 +2,133 @@
 PyTorch Dataset class for training the Mc-Imagine model.
 """
 
-from typing import Dict, Any, Optional
+import glob
+import os
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from mc_imagine_model.data.labeler import ChunkLabeler
+from mc_imagine_model.data.world_generator import CANVAS, HALO_MARGIN, REGION_BLOCKS
+from mc_imagine_model.tokenizer_utils import MAX_PROMPT_TOKENS, tokenize
+
+CHUNKS_PER_REGION_SIDE = REGION_BLOCKS // 16  # 32
+QUARTER = 4  # biome_grid quarter-resolution factor
 
 
 class McImagineDataset(Dataset):
     """
-    Dataset for loading prompt-conditioned chunk data.
+    Dataset for loading prompt-conditioned chunk data, sourced from `.npz` macro-region shards
+    written by `data/world_generator.py`'s `ProceduralWorldSource.generate_shards`.
+
+    Each `__getitem__` call slices one 16x16 chunk (by `[cx, cz]` within its containing macro-region)
+    out of the region's (CANVAS x CANVAS) heightfield/profile/biome rasters. `world_generator.py`
+    renders those rasters with a HALO_MARGIN border specifically so every chunk position — including
+    edge chunks — can be sliced without extra padding; see its module docstring and
+    docs/poc-plan.md §1b. Note what this dataset does *not* need to materialize: `block_volume`.
+    Per docs/poc-plan.md's Phase 6 export design, `block_volume` is a deterministic function of
+    (heightmap, profile, water_level, biome) computed by `torch.where`-style expansion *inside* the
+    exported graph — the network only ever predicts the ~350 scalars per chunk that determine it,
+    not the full 98,304-cell volume. Training therefore only needs heightmap/profile/water/biome
+    ground truth; `block_volume` stays a zero placeholder here (matching `structure_markers`/
+    `structure_graph_*`, which are also zeroed since this is a `structure_support: "none"` model).
     """
 
-    def __init__(self, data_dir: str, transform: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        data_dir: str,
+        transform: Optional[Any] = None,
+        chunks_per_region: int = 100,
+        max_tokens: int = MAX_PROMPT_TOKENS,
+        index_seed: int = 0,
+        shard_cache_size: int = 32,
+        shard_paths: Optional[List[str]] = None,
+    ) -> None:
         """
         Args:
-            data_dir (str): Directory containing the processed chunk data.
+            data_dir (str): Directory containing `region_*.npz` shards (see
+                `data/world_generator.py`'s `ProceduralWorldSource.generate_shards`).
             transform (callable, optional): Optional transform to be applied on a sample.
+            chunks_per_region (int): How many of a region's 32x32=1024 chunk positions to include
+                in the dataset index (subsampled, deterministically, per region) — see
+                docs/poc-plan.md's Phase 4 target of "~200k chunk samples across ~2k parameter draws".
+            max_tokens (int): Prompt token sequence length (must match `capabilities.max_prompt_tokens`).
+            index_seed (int): Seed for the deterministic per-region chunk-position subsample and for
+                `ChunkLabeler`'s template/synonym choice.
+            shard_cache_size (int): Number of decompressed region shards to keep resident (simple
+                LRU) — avoids re-decompressing the same `.npz` array repeatedly across the ~100
+                samples drawn from each region.
+            shard_paths (list[str], optional): Explicit list of shard paths to use instead of
+                globbing `data_dir` — lets a caller (see `training/train.py`) split shards by
+                *region* into train/val sets (holding out whole regions, not random chunks within
+                them, since chunks from the same region share a caption and are highly correlated).
         """
         self.data_dir = data_dir
         self.transform = transform
-        # TODO: Load dataset index/metadata
+        self.max_tokens = max_tokens
+
+        if shard_paths is not None:
+            shard_paths = list(shard_paths)
+        else:
+            shard_paths = sorted(glob.glob(os.path.join(data_dir, "region_*.npz")))
+            if not shard_paths:
+                # Also allow pointing directly at a directory containing shards nested one level down
+                shard_paths = sorted(glob.glob(os.path.join(data_dir, "**", "region_*.npz"), recursive=True))
+
+        labeler = ChunkLabeler(rng_seed=index_seed)
+        self._region_meta: Dict[str, Dict[str, Any]] = {}
+        index: List[Tuple[str, int, int]] = []
+
+        for shard_idx, path in enumerate(shard_paths):
+            with np.load(path) as npz:
+                params = {
+                    k[len("param_"):]: (npz[k].item() if npz[k].shape == () else npz[k])
+                    for k in npz.files
+                    if k.startswith("param_")
+                }
+            caption = labeler.label_region(params)
+            token_ids = tokenize(caption, max_tokens=max_tokens)
+            self._region_meta[path] = {
+                "params": params,
+                "caption": caption,
+                "token_ids": np.array(token_ids, dtype=np.int32),
+            }
+
+            rng = np.random.default_rng(index_seed + shard_idx * 7919 + 1)
+            n_total = CHUNKS_PER_REGION_SIDE * CHUNKS_PER_REGION_SIDE
+            n_pick = min(chunks_per_region, n_total)
+            chosen_flat = rng.choice(n_total, size=n_pick, replace=False)
+            for flat in chosen_flat:
+                cx, cz = divmod(int(flat), CHUNKS_PER_REGION_SIDE)
+                index.append((path, cx, cz))
+
+        self.shard_paths = shard_paths
+        self.index = index
+        self._shard_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._shard_cache_size = shard_cache_size
 
     def __len__(self) -> int:
-        # TODO: Return actual dataset size
-        return 0
+        return len(self.index)
+
+    def _load_shard(self, path: str) -> Dict[str, Any]:
+        cached = self._shard_cache.get(path)
+        if cached is not None:
+            self._shard_cache.move_to_end(path)
+            return cached
+        with np.load(path) as npz:
+            data = {
+                "heightfield": npz["heightfield"],
+                "profile_map": npz["profile_map"],
+                "biome_map": npz["biome_map"],
+                "water_level": float(npz["water_level"]),
+            }
+        self._shard_cache[path] = data
+        if len(self._shard_cache) > self._shard_cache_size:
+            self._shard_cache.popitem(last=False)
+        return data
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -47,21 +151,58 @@ class McImagineDataset(Dataset):
                   heightmap, block_volume, biome_grid, structure_markers, structure_graph_nodes,
                   structure_graph_edges, and structure_origin.
         """
-        # TODO: Load and return tensor data for the given index
-        return {
-            "prompt_tokens": torch.zeros(0),
-            "chunk_x": torch.tensor(0),
-            "chunk_z": torch.tensor(0),
-            "seed": torch.tensor(0),
+        path, cx, cz = self.index[idx]
+        shard = self._load_shard(path)
+        meta = self._region_meta[path]
+        params = meta["params"]
+
+        R = HALO_MARGIN
+        x0, x1 = cx * 16, cx * 16 + 16 + 2 * R
+        z0, z1 = cz * 16, cz * 16 + 16 + 2 * R
+        assert x1 <= CANVAS and z1 <= CANVAS, "chunk halo window exceeds region canvas"
+
+        # Core 16x16 crop (no halo) — matches model.onnx's actual output tensor shapes. The halo
+        # margin baked into the region raster (see world_generator.py) only exists so this slice is
+        # always valid, including at region edges; the network's own cross-chunk-continuity
+        # mechanism (CoordinateEncoder + valid-padded convs, docs/poc-plan.md §1b) is a pure
+        # function of chunk_x/chunk_z at inference time and needs no ground-truth halo data here.
+        height_core = shard["heightfield"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
+        profile_core = shard["profile_map"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
+        biome_core = shard["biome_map"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
+
+        # biome_grid ground truth at quarter resolution (4x4), majority-vote per 4x4 block.
+        biome_quarter = np.zeros((QUARTER, QUARTER), dtype=np.int64)
+        for bz in range(QUARTER):
+            for bx in range(QUARTER):
+                block = biome_core[bz * 4 : bz * 4 + 4, bx * 4 : bx * 4 + 4]
+                counts = np.bincount(block.reshape(-1).astype(np.int64))
+                biome_quarter[bz, bx] = int(np.argmax(counts))
+
+        water_level = float(shard["water_level"])
+
+        chunk_x_global = int(params["region_x"]) * CHUNKS_PER_REGION_SIDE + cx
+        chunk_z_global = int(params["region_z"]) * CHUNKS_PER_REGION_SIDE + cz
+
+        sample = {
+            "prompt_tokens": torch.from_numpy(meta["token_ids"].copy()).to(torch.int32),
+            "chunk_x": torch.tensor(chunk_x_global, dtype=torch.int32),
+            "chunk_z": torch.tensor(chunk_z_global, dtype=torch.int32),
+            "seed": torch.tensor(int(params["seed"]), dtype=torch.int64),
             "capability_tier": "none",
-            "heightmap": torch.zeros(0),
-            "block_volume": torch.zeros(0),
-            "biome_grid": torch.zeros(0),
+            "heightmap": torch.from_numpy(height_core.copy()).to(torch.float32),
+            "profile_id": torch.from_numpy(profile_core.copy().astype(np.int64)),
+            "water_level": torch.tensor(water_level, dtype=torch.float32),
+            "block_volume": torch.zeros(0),  # see class docstring — derived at export time, not trained
+            "biome_grid": torch.from_numpy(biome_quarter.copy()),
             "structure_markers": torch.zeros(0),
             "structure_graph_nodes": torch.zeros(0),
             "structure_graph_edges": torch.zeros(0),
             "structure_origin": torch.zeros(0),
+            "caption": meta["caption"],
         }
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample
 
 
 class McImagineMacroDataset(Dataset):
@@ -75,6 +216,10 @@ class McImagineMacroDataset(Dataset):
     Note the natural alignment with data sourcing: world_generator.py + chunk_extractor.py already
     operate on .mca region files (see PROJECT.md "Model Training Pipeline" data sourcing section),
     so a macro-region training sample and a raw extracted region file cover the same ground.
+
+    Not implemented in this pass: `imaginator-low_intensity-no_structures` (the only model this PoC
+    trains) declares `requires_macro_field: false` and never trains or exports `macro.onnx` — see
+    docs/poc-plan.md's scope.
     """
 
     def __init__(self, data_dir: str, transform: Optional[Any] = None) -> None:

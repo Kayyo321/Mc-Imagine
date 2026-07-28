@@ -1,10 +1,13 @@
 package com.mcimagine.model;
 
+import ai.onnxruntime.OnnxJavaType;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OnnxValue;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
+import ai.onnxruntime.TensorInfo;
+import com.mcimagine.McImagine;
 import com.mcimagine.api.ModelInfo;
 
 import java.nio.file.Path;
@@ -13,16 +16,20 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Bridge between the mod and ONNX Runtime. Wraps an ONNX Runtime inference session.
+ * Bridge between the mod and ONNX Runtime. Wraps an ONNX Runtime inference session for a single
+ * per-chunk graph ({@code model.onnx}).
  */
 public class ModelSession implements AutoCloseable {
 
+    private static final int DEFAULT_MAX_TOKENS = 128;
+
+    /** {@link OrtEnvironment} is a process-wide singleton (bug #3 fix) — never closed by an individual session. */
     private OrtEnvironment env;
     private OrtSession session;
     private boolean isClosed = false;
 
     public ModelSession() {
-        // Default constructor
+        // Default constructor - no model loaded, generateChunk falls back to FallbackTerrain.
     }
 
     public ModelSession(byte[] modelBytes) throws OrtException {
@@ -43,14 +50,27 @@ public class ModelSession implements AutoCloseable {
         this(Path.of(modelInfo.path()));
     }
 
+    public boolean isLoaded() {
+        return session != null && env != null;
+    }
+
+    public Set<String> getInputNames() throws OrtException {
+        return session != null ? session.getInputNames() : Set.of();
+    }
+
+    public Set<String> getOutputNames() throws OrtException {
+        return session != null ? session.getOutputNames() : Set.of();
+    }
+
     public ChunkOutput generateChunk(int chunkX, int chunkZ, long seed, int[] promptTokens) throws Exception {
         if (session == null || env == null) {
-            return generateFallbackChunkOutput(chunkX, chunkZ);
+            return FallbackTerrain.generateFallbackChunkOutput(chunkX, chunkZ);
         }
 
-        int[] tokens = new int[128];
+        int maxTokens = DEFAULT_MAX_TOKENS;
+        int[] tokens = new int[maxTokens];
         if (promptTokens != null && promptTokens.length > 0) {
-            System.arraycopy(promptTokens, 0, tokens, 0, Math.min(promptTokens.length, 128));
+            System.arraycopy(promptTokens, 0, tokens, 0, Math.min(promptTokens.length, maxTokens));
         }
 
         int[][] tokens2D = new int[][]{ tokens };
@@ -61,56 +81,51 @@ public class ModelSession implements AutoCloseable {
         Map<String, OnnxTensor> inputs = new HashMap<>();
         Set<String> sessionInputNames = session.getInputNames();
 
-        OnnxTensor promptTensor = null;
-        OnnxTensor chunkXTensor = null;
-        OnnxTensor chunkZTensor = null;
-        OnnxTensor seedTensor = null;
-
         try {
             if (sessionInputNames.contains("prompt_tokens")) {
-                promptTensor = OnnxTensor.createTensor(env, tokens2D);
-                inputs.put("prompt_tokens", promptTensor);
+                inputs.put("prompt_tokens", OnnxTensor.createTensor(env, tokens2D));
             }
             if (sessionInputNames.contains("chunk_x")) {
-                chunkXTensor = OnnxTensor.createTensor(env, cx);
-                inputs.put("chunk_x", chunkXTensor);
+                inputs.put("chunk_x", OnnxTensor.createTensor(env, cx));
             }
             if (sessionInputNames.contains("chunk_z")) {
-                chunkZTensor = OnnxTensor.createTensor(env, cz);
-                inputs.put("chunk_z", chunkZTensor);
+                inputs.put("chunk_z", OnnxTensor.createTensor(env, cz));
             }
             if (sessionInputNames.contains("seed")) {
-                seedTensor = OnnxTensor.createTensor(env, s);
-                inputs.put("seed", seedTensor);
+                inputs.put("seed", OnnxTensor.createTensor(env, s));
             }
 
             try (OrtSession.Result results = session.run(inputs)) {
                 int[] heightmap = new int[256];
                 int[] blockVolume = new int[0];
-                int[] biomeGrid = new int[256];
+                int[] biomeGrid = new int[0];
                 float[][] structureMarkers = new float[0][0];
 
-                boolean foundHeightmap = false;
-
+                // Bug #1 fix: dispatch strictly by exact tensor name (docs/model-spec.md's pinned output
+                // names), never "the first output of any name" — with a 3-output model that previously
+                // misread block_volume as the heightmap.
                 for (Map.Entry<String, OnnxValue> entry : results) {
                     String name = entry.getKey();
                     OnnxValue value = entry.getValue();
-
-                    if (value instanceof OnnxTensor outputTensor) {
-                        Object rawVal = outputTensor.getValue();
-                        if ("heightmap".equalsIgnoreCase(name) || !foundHeightmap) {
-                            heightmap = extractHeightmap(rawVal);
-                            foundHeightmap = true;
-                        } else if ("block_volume".equalsIgnoreCase(name) || "blocks".equalsIgnoreCase(name)) {
-                            blockVolume = extractIntArray(rawVal);
-                        } else if ("biomes".equalsIgnoreCase(name) || "biome_grid".equalsIgnoreCase(name)) {
-                            biomeGrid = extractIntArray(rawVal);
+                    if (!(value instanceof OnnxTensor tensor)) {
+                        continue;
+                    }
+                    switch (name) {
+                        case "heightmap" -> heightmap = padOrTruncate(extractTensorAsInts(tensor, name), 256, heightmap);
+                        case "block_volume" -> blockVolume = extractTensorAsInts(tensor, name);
+                        case "biome_grid" -> biomeGrid = extractTensorAsInts(tensor, name);
+                        default -> {
+                            // Unknown/unsupported output for this tier (e.g. structure_* tensors on a
+                            // "none" structure_support model) - ignore rather than misinterpret it.
                         }
                     }
                 }
 
                 if (blockVolume.length == 0 && heightmap.length > 0) {
-                    blockVolume = buildBlockVolumeFromHeightmap(heightmap);
+                    blockVolume = FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap);
+                }
+                if (biomeGrid.length == 0) {
+                    biomeGrid = new int[4 * 96 * 4];
                 }
 
                 return new ChunkOutput(heightmap, blockVolume, biomeGrid, structureMarkers);
@@ -124,106 +139,79 @@ public class ModelSession implements AutoCloseable {
         }
     }
 
+    /**
+     * Runs a one-time trial inference with dummy zero-filled inputs, matching the shapes/names this
+     * session's graph declares. Used by {@link ModelLoader} at discovery time so a broken graph is marked
+     * unavailable up front rather than failing on the first real chunk request (PROJECT.md §"Error Handling
+     * & Fallback Chain" / docs/model-spec.md's "Load time" guidance).
+     */
+    public boolean trialInference(int maxPromptTokens) {
+        if (session == null || env == null) {
+            return true; // no graph loaded at all is handled by the FallbackTerrain path, not a failure.
+        }
+        try {
+            ChunkOutput output = generateChunk(0, 0, 0L, new int[Math.max(1, maxPromptTokens)]);
+            return output != null;
+        } catch (Exception e) {
+            McImagine.LOGGER.warn("ModelSession: trial inference failed, marking model unavailable: {}", e.getMessage());
+            return false;
+        }
+    }
+
     public ChunkOutput inferChunk(ChunkInput input) {
         try {
             int[] tokens = input.promptTokens() != null ? input.promptTokens() : new int[0];
             return generateChunk(input.chunkX(), input.chunkZ(), input.seed(), tokens);
         } catch (Exception e) {
-            e.printStackTrace();
-            return generateFallbackChunkOutput(input.chunkX(), input.chunkZ());
+            McImagine.LOGGER.warn("ModelSession: inference failed for chunk ({}, {}), using fallback terrain: {}",
+                    input.chunkX(), input.chunkZ(), e.getMessage());
+            return FallbackTerrain.generateFallbackChunkOutput(input.chunkX(), input.chunkZ());
         }
     }
 
-    private int[] extractHeightmap(Object rawVal) {
-        int[] hmap = new int[256];
-        if (rawVal instanceof float[][] matrix2d) {
-            for (int r = 0; r < matrix2d.length && r < 16; r++) {
-                for (int c = 0; c < matrix2d[r].length && c < 16; c++) {
-                    hmap[r * 16 + c] = Math.round(matrix2d[r][c]);
-                }
-            }
-        } else if (rawVal instanceof float[][][] tensor3d) {
-            float[][] matrix2d = tensor3d[0];
-            for (int r = 0; r < matrix2d.length && r < 16; r++) {
-                for (int c = 0; c < matrix2d[r].length && c < 16; c++) {
-                    hmap[r * 16 + c] = Math.round(matrix2d[r][c]);
-                }
-            }
-        } else if (rawVal instanceof float[] flat) {
-            for (int i = 0; i < flat.length && i < 256; i++) {
-                hmap[i] = Math.round(flat[i]);
-            }
-        } else if (rawVal instanceof double[][] matrix2d) {
-            for (int r = 0; r < matrix2d.length && r < 16; r++) {
-                for (int c = 0; c < matrix2d[r].length && c < 16; c++) {
-                    hmap[r * 16 + c] = (int) Math.round(matrix2d[r][c]);
-                }
-            }
-        } else if (rawVal instanceof double[] flat) {
-            for (int i = 0; i < flat.length && i < 256; i++) {
-                hmap[i] = (int) Math.round(flat[i]);
-            }
-        } else if (rawVal instanceof int[][] matrix2d) {
-            for (int r = 0; r < matrix2d.length && r < 16; r++) {
-                for (int c = 0; c < matrix2d[r].length && c < 16; c++) {
-                    hmap[r * 16 + c] = matrix2d[r][c];
-                }
-            }
-        } else if (rawVal instanceof int[] flat) {
-            for (int i = 0; i < flat.length && i < 256; i++) {
-                hmap[i] = flat[i];
-            }
-        }
-        return hmap;
-    }
-
-    private int[] extractIntArray(Object rawVal) {
-        if (rawVal instanceof int[] arr) {
+    private static int[] padOrTruncate(int[] arr, int expectedLength, int[] fallback) {
+        if (arr.length == expectedLength) {
             return arr;
-        } else if (rawVal instanceof float[] arr) {
-            int[] result = new int[arr.length];
-            for (int i = 0; i < arr.length; i++) {
-                result[i] = Math.round(arr[i]);
-            }
-            return result;
         }
-        return new int[0];
+        if (arr.length == 0) {
+            return fallback;
+        }
+        int[] out = new int[expectedLength];
+        System.arraycopy(arr, 0, out, 0, Math.min(arr.length, expectedLength));
+        return out;
     }
 
-    private int[] buildBlockVolumeFromHeightmap(int[] heightmap) {
-        int minY = -64;
-        int maxY = 320;
-        int heightSpan = maxY - minY; // 384
-        int[] blockVolume = new int[16 * heightSpan * 16];
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                int h = heightmap[z * 16 + x];
-                for (int y = minY; y <= h && y < maxY; y++) {
-                    int yIdx = y - minY;
-                    int index = (yIdx * 16 + z) * 16 + x;
-                    if (index >= 0 && index < blockVolume.length) {
-                        if (y < h - 1) blockVolume[index] = 1; // Stone
-                        else if (y == h - 1) blockVolume[index] = 2; // Dirt
-                        else blockVolume[index] = 3; // Grass Block
-                    }
-                }
+    /**
+     * Reads a tensor's raw contents into a flat {@code int[]} via its typed NIO buffer (bug #2 fix) rather
+     * than materializing a nested Java array and pattern-matching on its shape — this is what previously
+     * silently returned {@code new int[0]} for a nested {@code int[16][384][16]} block_volume output.
+     */
+    private int[] extractTensorAsInts(OnnxTensor tensor, String tensorName) {
+        try {
+            TensorInfo info = tensor.getInfo();
+            int numElements = (int) info.getNumElements();
+            int[] out = new int[numElements];
+            OnnxJavaType type = info.type;
+            if (type == OnnxJavaType.INT32) {
+                tensor.getIntBuffer().get(out);
+            } else if (type == OnnxJavaType.INT64) {
+                java.nio.LongBuffer buf = tensor.getLongBuffer();
+                for (int i = 0; i < numElements; i++) out[i] = (int) buf.get(i);
+            } else if (type == OnnxJavaType.FLOAT) {
+                java.nio.FloatBuffer buf = tensor.getFloatBuffer();
+                for (int i = 0; i < numElements; i++) out[i] = Math.round(buf.get(i));
+            } else if (type == OnnxJavaType.DOUBLE) {
+                java.nio.DoubleBuffer buf = tensor.getDoubleBuffer();
+                for (int i = 0; i < numElements; i++) out[i] = (int) Math.round(buf.get(i));
+            } else {
+                McImagine.LOGGER.warn("ModelSession: output '{}' has unsupported dtype {}; ignoring", tensorName, type);
+                return new int[0];
             }
+            return out;
+        } catch (Exception e) {
+            McImagine.LOGGER.warn("ModelSession: failed to extract output '{}': {}", tensorName, e.getMessage());
+            return new int[0];
         }
-        return blockVolume;
-    }
-
-    private ChunkOutput generateFallbackChunkOutput(int chunkX, int chunkZ) {
-        int[] heightmap = new int[256];
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                int globalX = chunkX * 16 + x;
-                int globalZ = chunkZ * 16 + z;
-                int h = 60 + (int) (Math.sin(globalX / 10.0) * 5.0 + Math.cos(globalZ / 10.0) * 5.0);
-                heightmap[z * 16 + x] = h;
-            }
-        }
-        int[] blockVolume = buildBlockVolumeFromHeightmap(heightmap);
-        return new ChunkOutput(heightmap, blockVolume, new int[256], new float[0][0]);
     }
 
     @Override
@@ -233,9 +221,8 @@ public class ModelSession implements AutoCloseable {
             if (session != null) {
                 try { session.close(); } catch (Exception ignored) {}
             }
-            if (env != null) {
-                try { env.close(); } catch (Exception ignored) {}
-            }
+            // Bug #3 fix: OrtEnvironment.getEnvironment() is a process-wide singleton shared by every
+            // ModelSession in the JVM - only the session owned by this instance is ever closed here.
         }
     }
 }

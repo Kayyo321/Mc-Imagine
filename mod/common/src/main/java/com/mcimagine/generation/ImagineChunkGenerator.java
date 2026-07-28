@@ -1,12 +1,18 @@
 package com.mcimagine.generation;
 
+import com.mcimagine.McImagine;
 import com.mcimagine.api.ModelInfo;
+import com.mcimagine.model.BlockPalette;
 import com.mcimagine.model.ChunkOutput;
+import com.mcimagine.model.FallbackTerrain;
 import com.mcimagine.model.ModelLoader;
+import com.mcimagine.model.ModelRegistry;
 import com.mcimagine.model.ModelSession;
+import com.mcimagine.prompt.PromptTokenizer;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.server.level.WorldGenRegion;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.LevelHeightAccessor;
@@ -18,28 +24,50 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.GenerationStep;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
+import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.blending.Blender;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 
 /**
  * Replaces vanilla chunk generation with AI-powered generation driven by ONNX model tensors.
+ *
+ * <p><b>Deviation from docs/poc-plan.md §1a:</b> the plan calls for extending
+ * {@link NoiseBasedChunkGenerator} directly so vanilla {@code applyCarvers}/{@code buildSurface}/
+ * {@code spawnOriginalMobs} are inherited "for free." In the actual 1.20.1 Mojang-mapped sources verified
+ * here, {@code NoiseBasedChunkGenerator} is declared {@code final} and cannot be subclassed at all (this
+ * was only discoverable by attempting the build - it compiles as "cannot inherit from final
+ * NoiseBasedChunkGenerator"). This class therefore extends {@link ChunkGenerator} directly (as the
+ * pre-existing Phase 1 code already did) and achieves the identical practical effect via composition: a
+ * private {@link #vanillaDelegate} {@code NoiseBasedChunkGenerator}, built from the same biome source and
+ * settings, that {@link #applyCarvers}, {@link #buildSurface}, {@link #spawnOriginalMobs}, and the
+ * gen-depth/sea-level/min-Y accessors all delegate to. {@code createStructures}/{@code applyBiomeDecoration}
+ * still come for free from {@link ChunkGenerator} itself (they were never {@code NoiseBasedChunkGenerator}-
+ * specific). Only {@link #fillFromNoise}, {@link #getBaseHeight}, {@link #getBaseColumn}, and
+ * {@link #codec()} carry AI-authored logic, matching the plan's intent even though the literal inheritance
+ * mechanism had to change.
  */
 public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseable {
 
     public static final Codec<ImagineChunkGenerator> CODEC = RecordCodecBuilder.create(instance ->
             instance.group(
-                    BiomeSource.CODEC.fieldOf("biome_source").forGetter(ImagineChunkGenerator::getBiomeSource)
+                    BiomeSource.CODEC.fieldOf("biome_source").forGetter(ImagineChunkGenerator::getBiomeSource),
+                    NoiseGeneratorSettings.CODEC.fieldOf("settings").forGetter(ImagineChunkGenerator::generatorSettings),
+                    Codec.STRING.optionalFieldOf("prompt", "").forGetter(ImagineChunkGenerator::getPrompt),
+                    Codec.STRING.optionalFieldOf("model_id", "").forGetter(ImagineChunkGenerator::getModelId),
+                    Codec.LONG.optionalFieldOf("mcimagine_seed", 0L).forGetter(ImagineChunkGenerator::getSeed)
             ).apply(instance, instance.stable(ImagineChunkGenerator::new))
     );
 
@@ -55,84 +83,144 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
             Paths.get("../../models/mcimagine")
     };
 
+    private final Holder<NoiseGeneratorSettings> settings;
+    /** Composition stand-in for the (final, un-subclassable) NoiseBasedChunkGenerator - see class javadoc. */
+    private final NoiseBasedChunkGenerator vanillaDelegate;
+
+    private final String prompt;
+    private final String modelId;
+    private final long seed;
+    private final int[] promptTokens;
+    private final ChunkCache chunkCache = new ChunkCache();
+
     private ModelSession modelSession;
-    private ModelLoader modelLoader;
     private ModelInfo modelInfo;
-    private long seed = 0L;
-    private int[] promptTokens = new int[128];
-    private final Map<Long, ChunkOutput> chunkCache = new ConcurrentHashMap<>();
+    private ModelLoader modelLoader;
+    private BlockPalette blockPalette = new BlockPalette(List.of());
 
-    public ImagineChunkGenerator(BiomeSource biomeSource) {
-        this(biomeSource, (Path) null);
+    /** Plain construction with no prompt/model selected yet - resolves whatever default model it can find. */
+    public ImagineChunkGenerator(BiomeSource biomeSource, Holder<NoiseGeneratorSettings> settings) {
+        this(biomeSource, settings, "", "", 0L);
     }
 
-    public ImagineChunkGenerator(BiomeSource biomeSource, Path customModelPath) {
+    /**
+     * The CODEC- and UI-driven constructor: carries the prompt string, selected model id, and world seed so
+     * they persist into {@code level.dat} and survive a reload (docs/poc-plan.md Phase 2 gate).
+     */
+    public ImagineChunkGenerator(BiomeSource biomeSource, Holder<NoiseGeneratorSettings> settings,
+                                 String prompt, String modelId, long seed) {
         super(biomeSource);
-        initModel(customModelPath);
-    }
-
-    public ImagineChunkGenerator(BiomeSource biomeSource, ModelSession modelSession) {
-        super(biomeSource);
-        this.modelSession = modelSession;
-    }
-
-    public ImagineChunkGenerator(BiomeSource biomeSource, ModelSession modelSession, long seed, int[] promptTokens) {
-        super(biomeSource);
-        this.modelSession = modelSession;
+        this.settings = settings;
+        this.vanillaDelegate = new NoiseBasedChunkGenerator(biomeSource, settings);
+        this.prompt = prompt != null ? prompt : "";
+        this.modelId = modelId != null ? modelId : "";
         this.seed = seed;
-        if (promptTokens != null) {
-            this.promptTokens = promptTokens;
+        initModel(null);
+        this.promptTokens = tokenizePrompt();
+        attachBiomeSourceIfPossible(biomeSource);
+    }
+
+    /** Test/debug convenience constructor: resolves a model directly from a directory or {@code .mcim} path. */
+    public ImagineChunkGenerator(BiomeSource biomeSource, Holder<NoiseGeneratorSettings> settings, Path customModelPath) {
+        super(biomeSource);
+        this.settings = settings;
+        this.vanillaDelegate = new NoiseBasedChunkGenerator(biomeSource, settings);
+        this.prompt = "";
+        this.modelId = "";
+        this.seed = 0L;
+        initModel(customModelPath);
+        this.promptTokens = tokenizePrompt();
+        attachBiomeSourceIfPossible(biomeSource);
+    }
+
+    /** Test convenience constructor for an explicit, already-constructed {@link ModelSession}. */
+    public ImagineChunkGenerator(BiomeSource biomeSource, Holder<NoiseGeneratorSettings> settings, ModelSession modelSession) {
+        super(biomeSource);
+        this.settings = settings;
+        this.vanillaDelegate = new NoiseBasedChunkGenerator(biomeSource, settings);
+        this.prompt = "";
+        this.modelId = "";
+        this.seed = 0L;
+        this.modelSession = modelSession;
+        this.promptTokens = tokenizePrompt();
+        attachBiomeSourceIfPossible(biomeSource);
+    }
+
+    private void attachBiomeSourceIfPossible(BiomeSource biomeSource) {
+        if (biomeSource instanceof ImagineBiomeSource imagineBiomeSource) {
+            imagineBiomeSource.attachGenerator(this);
         }
     }
 
     private void initModel(Path customModelPath) {
-        if (customModelPath != null && Files.exists(customModelPath)) {
-            if (Files.isDirectory(customModelPath)) {
-                if (loadFromDirectory(customModelPath)) return;
-            } else if (customModelPath.toString().endsWith(".mcim")) {
-                if (loadFromMcimFile(customModelPath)) return;
+        Path modelsDir = resolveModelsDirectory(customModelPath);
+
+        if (modelsDir != null) {
+            if (!modelId.isBlank()) {
+                var sessionOpt = ModelRegistry.getOrLoad(modelId, modelsDir);
+                if (sessionOpt.isPresent()) {
+                    this.modelSession = sessionOpt.get();
+                    this.modelInfo = ModelRegistry.getInfo(modelId).orElse(null);
+                    this.blockPalette = new BlockPalette(modelInfo != null ? modelInfo.capabilities().blockPalette() : List.of());
+                    return;
+                }
+                McImagine.LOGGER.warn("ImagineChunkGenerator: requested model '{}' not found/available in {}; " +
+                        "falling back to the default model selection", modelId, modelsDir);
+            }
+            if (loadFromDirectory(modelsDir)) {
+                return;
+            }
+        } else if (customModelPath != null && customModelPath.toString().endsWith(".mcim") && Files.exists(customModelPath)) {
+            if (loadFromMcimFile(customModelPath)) {
+                return;
             }
         }
 
+        // Fallback session - FallbackTerrain sine-wave terrain, no ONNX graph loaded.
+        this.modelSession = new ModelSession();
+    }
+
+    private Path resolveModelsDirectory(Path customModelPath) {
+        if (customModelPath != null && Files.exists(customModelPath) && Files.isDirectory(customModelPath)) {
+            return customModelPath;
+        }
         String sysPropPath = System.getProperty("mcimagine.model.path");
         if (sysPropPath != null) {
             Path path = Paths.get(sysPropPath);
-            if (Files.exists(path)) {
-                if (Files.isDirectory(path)) {
-                    if (loadFromDirectory(path)) return;
-                } else if (loadFromMcimFile(path)) return;
+            if (Files.exists(path) && Files.isDirectory(path)) {
+                return path;
             }
         }
-
         for (Path dir : DEFAULT_MODEL_DIRS) {
             if (Files.exists(dir) && Files.isDirectory(dir)) {
-                if (loadFromDirectory(dir)) {
-                    return;
-                }
+                return dir;
             }
         }
-
-        // Fallback session
-        this.modelSession = new ModelSession();
+        return null;
     }
 
     private boolean loadFromDirectory(Path dir) {
         try {
             ModelLoader loader = new ModelLoader(dir);
             List<ModelInfo> models = loader.discoverModels();
-            if (!models.isEmpty()) {
-                ModelInfo selected = models.stream()
-                        .filter(m -> "dummy-test-v1".equals(m.id()) || (m.path() != null && m.path().contains("dummy-test-v1")))
-                        .findFirst()
-                        .orElse(models.get(0));
-                byte[] bytes = loader.extractModelBytes(selected);
-                this.modelLoader = loader;
-                this.modelInfo = selected;
-                this.modelSession = new ModelSession(bytes);
-                return true;
+            List<ModelInfo> availableModels = models.stream().filter(ModelInfo::available).toList();
+            if (availableModels.isEmpty()) {
+                return false;
             }
+            ModelInfo selected = availableModels.stream()
+                    .filter(m -> "dummy-test-v1".equals(m.id()) || (m.path() != null && m.path().contains("dummy-test-v1")))
+                    .findFirst()
+                    .orElse(availableModels.get(0));
+            byte[] bytes = loader.extractModelBytes(selected);
+            ModelSession session = new ModelSession(bytes);
+            ModelRegistry.register(selected, session);
+            this.modelLoader = loader;
+            this.modelInfo = selected;
+            this.modelSession = session;
+            this.blockPalette = new BlockPalette(selected.capabilities().blockPalette());
+            return true;
         } catch (Exception e) {
-            e.printStackTrace();
+            McImagine.LOGGER.warn("ImagineChunkGenerator: failed to load a model from {}: {}", dir, e.getMessage());
         }
         return false;
     }
@@ -142,17 +230,47 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
             Path parent = mcimFile.getParent() != null ? mcimFile.getParent() : Paths.get(".");
             ModelLoader loader = new ModelLoader(parent);
             ModelInfo info = loader.parseModelInfo(mcimFile);
-            if (info != null) {
+            if (info != null && info.available()) {
                 byte[] bytes = loader.extractModelBytes(info);
+                ModelSession session = new ModelSession(bytes);
+                ModelRegistry.register(info, session);
                 this.modelLoader = loader;
                 this.modelInfo = info;
-                this.modelSession = new ModelSession(bytes);
+                this.modelSession = session;
+                this.blockPalette = new BlockPalette(info.capabilities().blockPalette());
                 return true;
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            McImagine.LOGGER.warn("ImagineChunkGenerator: failed to load {}: {}", mcimFile, e.getMessage());
         }
         return false;
+    }
+
+    private int[] tokenizePrompt() {
+        int maxTokens = (modelInfo != null && modelInfo.capabilities().maxPromptTokens() > 0)
+                ? modelInfo.capabilities().maxPromptTokens() : 128;
+
+        PromptTokenizer tokenizer = loadTokenizerForCurrentModel();
+        int[] tokens = tokenizer.tokenize(prompt, maxTokens);
+        McImagine.LOGGER.info("ImagineChunkGenerator: tokenized prompt \"{}\" (model={}, vocabSize={}) -> {}",
+                prompt, modelId.isBlank() ? "<default>" : modelId, tokenizer.vocabSize(), Arrays.toString(tokens));
+        return tokens;
+    }
+
+    private PromptTokenizer loadTokenizerForCurrentModel() {
+        if (modelInfo != null && modelInfo.path() != null) {
+            try {
+                Path mcimPath = Path.of(modelInfo.path());
+                ModelLoader loader = new ModelLoader(mcimPath.getParent());
+                String tokenizerJson = loader.extractTokenizerJson(mcimPath);
+                if (tokenizerJson != null) {
+                    return PromptTokenizer.fromTokenizerJson(tokenizerJson);
+                }
+            } catch (Exception ignored) {
+                // Fall through to an empty-vocab tokenizer below.
+            }
+        }
+        return new PromptTokenizer(Map.of());
     }
 
     public ChunkOutput generateOrGetChunkOutput(int chunkX, int chunkZ) {
@@ -163,35 +281,10 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
                     return modelSession.generateChunk(chunkX, chunkZ, seed, promptTokens);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
+                McImagine.LOGGER.warn("ImagineChunkGenerator: inference failed for chunk ({}, {}): {}", chunkX, chunkZ, e.getMessage());
             }
-            return generateFallbackChunkOutput(chunkX, chunkZ);
+            return FallbackTerrain.generateFallbackChunkOutput(chunkX, chunkZ);
         });
-    }
-
-    private ChunkOutput generateFallbackChunkOutput(int chunkX, int chunkZ) {
-        int[] heightmap = new int[256];
-        int defaultHeight = 60;
-        for (int i = 0; i < 256; i++) {
-            heightmap[i] = defaultHeight;
-        }
-        int minY = -64;
-        int heightSpan = 384;
-        int[] blockVolume = new int[16 * heightSpan * 16];
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                for (int y = minY; y <= defaultHeight; y++) {
-                    int yIdx = y - minY;
-                    int volIndex = (yIdx * 16 + z) * 16 + x;
-                    if (volIndex >= 0 && volIndex < blockVolume.length) {
-                        if (y < defaultHeight - 1) blockVolume[volIndex] = 1;
-                        else if (y == defaultHeight - 1) blockVolume[volIndex] = 2;
-                        else blockVolume[volIndex] = 3;
-                    }
-                }
-            }
-        }
-        return new ChunkOutput(heightmap, blockVolume, new int[256], new float[0][0]);
     }
 
     @Override
@@ -199,74 +292,144 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
         return CODEC;
     }
 
+    public Holder<NoiseGeneratorSettings> generatorSettings() {
+        return settings;
+    }
+
+    // --- Vanilla generation steps, delegated to vanillaDelegate (see class javadoc) ---
+    // This is what gives the §3 "none" row for free: vanilla caves/ravines carve the AI stone volume,
+    // SurfaceSystem dresses whatever blocks the AI wrote (biome-correct snow/sand/podzol), and original
+    // mobs spawn normally - all running unmodified against AI-authored terrain.
+
     @Override
-    public void applyCarvers(WorldGenRegion region, long seed, RandomState randomState, BiomeManager biomeManager, StructureManager structureManager, ChunkAccess chunk, GenerationStep.Carving step) {
+    public void applyCarvers(WorldGenRegion region, long carverSeed, RandomState randomState, BiomeManager biomeManager,
+                              StructureManager structureManager, ChunkAccess chunk, GenerationStep.Carving step) {
+        vanillaDelegate.applyCarvers(region, carverSeed, randomState, biomeManager, structureManager, chunk, step);
     }
 
     @Override
     public void buildSurface(WorldGenRegion region, StructureManager structureManager, RandomState randomState, ChunkAccess chunk) {
+        vanillaDelegate.buildSurface(region, structureManager, randomState, chunk);
     }
 
     @Override
     public void spawnOriginalMobs(WorldGenRegion region) {
+        vanillaDelegate.spawnOriginalMobs(region);
     }
 
     @Override
     public int getGenDepth() {
-        return 384;
+        return vanillaDelegate.getGenDepth();
     }
 
     @Override
-    public CompletableFuture<ChunkAccess> fillFromNoise(Executor executor, Blender blender, RandomState randomState, StructureManager structureManager, ChunkAccess chunk) {
+    public int getSeaLevel() {
+        return vanillaDelegate.getSeaLevel();
+    }
+
+    @Override
+    public int getMinY() {
+        return vanillaDelegate.getMinY();
+    }
+
+    @Override
+    public CompletableFuture<ChunkAccess> fillFromNoise(Executor executor, Blender blender, RandomState randomState,
+                                                         StructureManager structureManager, ChunkAccess chunk) {
         return CompletableFuture.supplyAsync(() -> {
             int chunkX = chunk.getPos().x;
             int chunkZ = chunk.getPos().z;
 
             ChunkOutput output = generateOrGetChunkOutput(chunkX, chunkZ);
-            int[] heightmap = output.heightmap();
-            int[] blockVolume = output.blockVolume();
+            int[] heightmap = validateHeightmap(output.heightmap(), chunkX, chunkZ);
+            int[] blockVolume = validateBlockVolume(output.blockVolume(), heightmap, chunkX, chunkZ);
 
             int minBuildHeight = chunk.getMinBuildHeight();
             int maxBuildHeight = chunk.getMaxBuildHeight();
+            int seaLevel = getSeaLevel();
 
-            for (int x = 0; x < 16; x++) {
-                for (int z = 0; z < 16; z++) {
-                    int height = (heightmap != null && heightmap.length >= 256)
-                            ? heightmap[z * 16 + x]
-                            : 60;
+            Heightmap worldSurface = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.WORLD_SURFACE_WG);
+            Heightmap oceanFloor = chunk.getOrCreateHeightmapUnprimed(Heightmap.Types.OCEAN_FLOOR_WG);
 
-                    for (int y = minBuildHeight; y <= height && y < maxBuildHeight; y++) {
-                        BlockState state;
-                        int yIdx = y - minBuildHeight;
-                        int volIndex = (yIdx * 16 + z) * 16 + x;
+            LevelChunkSection[] sections = chunk.getSections();
+            for (LevelChunkSection section : sections) {
+                section.acquire();
+            }
+            try {
+                for (int x = 0; x < 16; x++) {
+                    for (int z = 0; z < 16; z++) {
+                        for (int y = minBuildHeight; y < maxBuildHeight; y++) {
+                            BlockState state = resolveBlockState(blockVolume, x, y, z, seaLevel);
 
-                        if (blockVolume != null && volIndex >= 0 && volIndex < blockVolume.length && blockVolume[volIndex] != 0) {
-                            state = getBlockStateFromId(blockVolume[volIndex]);
-                        } else {
-                            if (y < height - 1) {
-                                state = Blocks.STONE.defaultBlockState();
-                            } else if (y == height - 1) {
-                                state = Blocks.DIRT.defaultBlockState();
-                            } else {
-                                state = Blocks.GRASS_BLOCK.defaultBlockState();
+                            int sectionIndex = chunk.getSectionIndex(y);
+                            if (sectionIndex < 0 || sectionIndex >= sections.length) {
+                                continue;
                             }
+                            int localY = y & 15;
+                            sections[sectionIndex].setBlockState(x, localY, z, state, false);
+
+                            // Bug #4 fix: prime WORLD_SURFACE_WG/OCEAN_FLOOR_WG as blocks are written, exactly
+                            // as vanilla's own generation does - without this, vanilla surface dressing,
+                            // decoration, and structure placement land in the wrong place or not at all.
+                            worldSurface.update(x, y, z, state);
+                            oceanFloor.update(x, y, z, state);
                         }
-                        chunk.setBlockState(new BlockPos(x, y, z), state, false);
                     }
+                }
+            } finally {
+                for (LevelChunkSection section : sections) {
+                    section.release();
                 }
             }
             return chunk;
         }, executor);
     }
 
-    @Override
-    public int getSeaLevel() {
-        return 63;
+    /**
+     * Resolves the block at a single column position, trusting the (validated) block_volume literally
+     * except for one targeted fallback: a declared-air cell at or below sea level fills with water, matching
+     * vanilla's always-full-to-sea-level ocean convention. A fully spec-conformant trained model already
+     * encodes this in its own block_volume via its export-time Where-based expansion
+     * (docs/model-spec.md); this only matters for {@link FallbackTerrain}'s Java-side synthesis, which only
+     * ever fills up to the surface and leaves everything above as air.
+     */
+    private BlockState resolveBlockState(int[] blockVolume, int localX, int y, int localZ, int seaLevel) {
+        int yIdx = y - FallbackTerrain.MIN_Y;
+        int index = FallbackTerrain.blockVolumeIndex(localX, yIdx, localZ);
+        int id = (blockVolume != null && index >= 0 && index < blockVolume.length) ? blockVolume[index] : 0;
+        if (id == 0 && y <= seaLevel) {
+            return Blocks.WATER.defaultBlockState();
+        }
+        return blockPalette.get(id);
     }
 
-    @Override
-    public int getMinY() {
-        return -64;
+    private int[] validateHeightmap(int[] raw, int chunkX, int chunkZ) {
+        if (raw == null || raw.length != 256) {
+            McImagine.LOGGER.warn("ImagineChunkGenerator: chunk ({}, {}) heightmap has {} elements (expected 256); " +
+                    "using fallback terrain for this chunk", chunkX, chunkZ, raw == null ? -1 : raw.length);
+            return FallbackTerrain.generateHeightmap(chunkX, chunkZ);
+        }
+        int[] clamped = new int[256];
+        for (int i = 0; i < 256; i++) {
+            clamped[i] = clampY(raw[i]);
+        }
+        return clamped;
+    }
+
+    private int[] validateBlockVolume(int[] raw, int[] heightmap, int chunkX, int chunkZ) {
+        int expectedLength = 16 * FallbackTerrain.HEIGHT_SPAN * 16;
+        if (raw == null || raw.length != expectedLength) {
+            if (raw != null && raw.length != 0) {
+                McImagine.LOGGER.warn("ImagineChunkGenerator: chunk ({}, {}) block_volume has {} elements " +
+                        "(expected {}); using heightmap-derived fallback volume for this chunk",
+                        chunkX, chunkZ, raw.length, expectedLength);
+            }
+            return FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap);
+        }
+        return raw;
+    }
+
+    private int clampY(int y) {
+        return Math.max(FallbackTerrain.MIN_Y, Math.min(y, FallbackTerrain.MAX_Y - 1));
     }
 
     @Override
@@ -278,10 +441,10 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
 
         ChunkOutput output = generateOrGetChunkOutput(chunkX, chunkZ);
         int[] heightmap = output.heightmap();
-        if (heightmap != null && heightmap.length >= 256) {
-            return heightmap[localZ * 16 + localX];
+        if (heightmap != null && heightmap.length == 256) {
+            return clampY(heightmap[localZ * 16 + localX]);
         }
-        return 60;
+        return clampY(60);
     }
 
     @Override
@@ -292,53 +455,29 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
         int localZ = Math.floorMod(z, 16);
 
         ChunkOutput output = generateOrGetChunkOutput(chunkX, chunkZ);
-        int height = (output.heightmap() != null && output.heightmap().length >= 256)
-                ? output.heightmap()[localZ * 16 + localX]
-                : 60;
+        int[] heightmap = validateHeightmap(output.heightmap(), chunkX, chunkZ);
+        int[] blockVolume = validateBlockVolume(output.blockVolume(), heightmap, chunkX, chunkZ);
 
         int minHeight = level.getMinBuildHeight();
         int maxHeight = level.getMaxBuildHeight();
-        int columnSpan = Math.max(0, height - minHeight + 1);
+        int seaLevel = getSeaLevel();
 
-        BlockState[] states = new BlockState[Math.min(columnSpan, maxHeight - minHeight)];
-        int[] blockVolume = output.blockVolume();
-
+        BlockState[] states = new BlockState[Math.max(0, maxHeight - minHeight)];
         for (int i = 0; i < states.length; i++) {
             int y = minHeight + i;
-            int volIndex = (i * 16 + localZ) * 16 + localX;
-            if (blockVolume != null && volIndex >= 0 && volIndex < blockVolume.length && blockVolume[volIndex] != 0) {
-                states[i] = getBlockStateFromId(blockVolume[volIndex]);
-            } else {
-                if (y < height - 1) states[i] = Blocks.STONE.defaultBlockState();
-                else if (y == height - 1) states[i] = Blocks.DIRT.defaultBlockState();
-                else if (y == height) states[i] = Blocks.GRASS_BLOCK.defaultBlockState();
-                else states[i] = Blocks.AIR.defaultBlockState();
-            }
+            states[i] = resolveBlockState(blockVolume, localX, y, localZ, seaLevel);
         }
         return new NoiseColumn(minHeight, states);
     }
 
     @Override
     public void addDebugScreenInfo(List<String> list, RandomState randomState, BlockPos pos) {
+        vanillaDelegate.addDebugScreenInfo(list, randomState, pos);
         if (modelInfo != null) {
             list.add("Model: " + modelInfo.name() + " v" + modelInfo.version());
         } else {
             list.add("Model: Fallback Engine");
         }
-    }
-
-    private BlockState getBlockStateFromId(int id) {
-        return switch (id) {
-            case 1 -> Blocks.STONE.defaultBlockState();
-            case 2 -> Blocks.DIRT.defaultBlockState();
-            case 3 -> Blocks.GRASS_BLOCK.defaultBlockState();
-            case 4 -> Blocks.OAK_LOG.defaultBlockState();
-            case 5 -> Blocks.OAK_LEAVES.defaultBlockState();
-            case 6 -> Blocks.WATER.defaultBlockState();
-            case 7 -> Blocks.SAND.defaultBlockState();
-            case 8 -> Blocks.BEDROCK.defaultBlockState();
-            default -> Blocks.STONE.defaultBlockState();
-        };
     }
 
     public ModelSession getModelSession() {
@@ -357,26 +496,22 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
         return modelInfo != null && modelSession != null;
     }
 
-    public void setPromptTokens(int[] promptTokens) {
-        if (promptTokens != null) {
-            this.promptTokens = promptTokens;
-            clearCache();
-        }
+    public String getPrompt() {
+        return prompt;
     }
 
-    public void setSeed(long seed) {
-        this.seed = seed;
-        clearCache();
+    public String getModelId() {
+        return modelId;
     }
 
-    public void clearCache() {
-        chunkCache.clear();
+    public long getSeed() {
+        return seed;
     }
 
     @Override
     public void close() throws Exception {
-        if (modelSession != null) {
-            modelSession.close();
-        }
+        // Sessions are owned by ModelRegistry (shared across generator instances) and closed on server
+        // stop, not here - closing per-generator-instance would break every other generator/world sharing
+        // the same loaded model.
     }
 }

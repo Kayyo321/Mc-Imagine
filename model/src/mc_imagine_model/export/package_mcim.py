@@ -1,19 +1,24 @@
 """
 Packaging script that bundles ONNX graph(s), tokenizer, and manifest into a .mcim ZIP file.
 
-Manifest shape follows docs/model-spec.md — keep this in sync with that document, not the other
-way around. As of format_version 0.4.0 a model may ship up to three ONNX graphs: model.onnx
-(per-chunk, always required), macro.onnx (per-macro-region, required iff
+Manifest shape follows docs/model-spec.md (format_version 0.5.0) — keep this in sync with that
+document, not the other way around. As of 0.4.0 a model may ship up to three ONNX graphs:
+model.onnx (per-chunk, always required), macro.onnx (per-macro-region, required iff
 capabilities.requires_macro_field), and detail.onnx (per-detail-pass, optional even when
-capabilities.detail_passes > 0 — its absence means the mod's built-in procedural decorator runs
-instead).
+capabilities.detail_passes > 0). 0.5.0 adds `capabilities.biome_palette` and pins the axis order
+documented in "Output Tensors" (this script doesn't encode axis order itself — that's a property of
+what export_onnx.py actually produces — but the manifest's capabilities block is what the mod uses
+to interpret the ids inside those tensors).
 """
 
 import argparse
 import json
 import os
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+
+FORMAT_VERSION = "0.5.0"
 
 
 def _chunk_output_names(structure_support: str) -> List[str]:
@@ -51,7 +56,7 @@ def _detail_io() -> Dict[str, List[str]]:
 
 
 def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
-    """Builds a manifest.json dict conforming to docs/model-spec.md (format_version 0.4.0)."""
+    """Builds a manifest.json dict conforming to docs/model-spec.md (format_version 0.5.0)."""
     capabilities: Dict[str, Any] = {
         "intensity": args.intensity,
         "terrain": True,
@@ -64,6 +69,8 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         "requires_macro_field": args.requires_macro_field,
         "detail_passes": args.detail_passes,
     }
+    if args.biome_palette:
+        capabilities["biome_palette"] = [b.strip() for b in args.biome_palette.split(",") if b.strip()]
     if args.structure_support == "intricate":
         capabilities["max_rooms"] = args.max_rooms
         capabilities["template_library_version"] = args.template_library_version
@@ -95,7 +102,7 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         io["detail"] = _detail_io()
 
     return {
-        "format_version": "0.4.0",
+        "format_version": FORMAT_VERSION,
         "model": {
             "id": args.model_id,
             "name": args.name,
@@ -139,6 +146,7 @@ def main() -> None:
     parser.add_argument("--caves", action="store_true")
     parser.add_argument("--prompt_tags", type=str, default="terrain")
     parser.add_argument("--block_palette", type=str, default="minecraft:stone,minecraft:dirt,minecraft:grass_block")
+    parser.add_argument("--biome_palette", type=str, default=None, help="Comma-separated namespaced biome ids biome_grid indexes into (0.5.0+)")
     parser.add_argument("--max_prompt_tokens", type=int, default=128)
     parser.add_argument("--max_rooms", type=int, default=12, help="Only used when structure_support=intricate")
     parser.add_argument("--template_library_version", type=str, default="0.1.0", help="Only used when structure_support=intricate")

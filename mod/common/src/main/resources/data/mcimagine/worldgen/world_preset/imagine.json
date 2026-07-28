@@ -7,7 +7,11 @@
         "biome_source": {
           "type": "minecraft:fixed",
           "biome": "minecraft:plains"
-        }
+        },
+        "settings": "minecraft:overworld",
+        "prompt": "",
+        "model_id": "",
+        "mcimagine_seed": 0
       }
     }
   }

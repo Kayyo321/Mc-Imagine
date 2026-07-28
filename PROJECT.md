@@ -26,15 +26,15 @@ rest of this document designs. Read in this order:
 | M2 | Gradle Dependency & Test Model | Add ONNX Runtime to gradle; create Python dummy model script & `dummy-test-v1.mcim` | M1 | DONE |
 | M3 | ModelLoader & ModelSession | Implement ZIP/manifest parsing in `ModelLoader` & ONNX runtime inference in `ModelSession` | M2 | DONE |
 | M4 | ImagineChunkGenerator Wiring | Connect `ImagineChunkGenerator` to `ModelSession` and place blocks from tensors | M3 | DONE |
-| M5 | Build, Verification & Audit | Verify gradle build, run unit/E2E test validation, forensic audit check | M4 | PLANNED |
-| M6 | Capability Manifest Schema | Extend `ModelInfo`/manifest.json with `capabilities` block; `ModelLoader` parses block palette + tier | M5 | PLANNED |
-| M7 | Prompt Capability Validation | Prompt tagger classifies requested prompt against model capability tags at world-creation time | M6 | PLANNED |
-| M8 | Tiered Generation Hooks | Wire `applyCarvers`/`buildSurface`/structure reservation to branch on model tier instead of no-op | M6 | PLANNED |
+| M5 | Build, Verification & Audit | Verify gradle build, run unit/E2E test validation, forensic audit check | M4 | DONE |
+| M6 | Capability Manifest Schema | Extend `ModelInfo`/manifest.json with `capabilities` block; `ModelLoader` parses block palette + tier | M5 | DONE |
+| M7 | Prompt Capability Validation | Prompt tagger classifies requested prompt against model capability tags at world-creation time | M6 | DONE |
+| M8 | Tiered Generation Hooks | Wire `applyCarvers`/`buildSurface`/structure reservation to branch on model tier instead of no-op | M6 | DONE |
 | M9 | Structure Compiler (Tier 3) | Implement room-graph decoding + template/loot/redstone composition for `intricate_structures` models | M8 | PLANNED |
 | M10 | Macro-Field Runtime | Implement `MacroCache`, per-macro-region `macro.onnx` invocation, and chunk-side slicing (`macro_local_height`/`flavor_zone_*`) — supersedes the earlier open "seam handling" question, see "Runtime Generation Lifecycle" | M6 | PLANNED |
 | M11 | Cache Bounding & Batched Inference | Replace unbounded `chunkCache` with bounded/evicting cache; add bounded `MacroCache`/`StructureRegistry`; batch adjacent chunk inference calls | M5, M10 | PLANNED |
-| M12 | Training Data Bring-up | Implement `world_generator.py` + `chunk_extractor.py` (procedural/mined sourcing) and `labeler.py` (auto-captioning) to produce real `McImagineDataset` samples | M6 | PLANNED |
-| M13 | ImagineNet Architecture | Implement `PromptEncoder` (MiniLM-class foundation), `CoordinateEncoder`/`SeedEncoder`, `TerrainHead`/`BiomeHead`, and train `imaginator-low_intensity-no_structures` end-to-end | M12 | PLANNED |
+| M12 | Training Data Bring-up | Implement `world_generator.py` + `chunk_extractor.py` (procedural/mined sourcing) and `labeler.py` (auto-captioning) to produce real `McImagineDataset` samples | M6 | DONE (procedural half only — `chunk_extractor.py`'s `.mca` path is deferred, see docs/poc-plan.md Phase 8) |
+| M13 | ImagineNet Architecture | Implement `PromptEncoder` (MiniLM-class foundation), `CoordinateEncoder`/`SeedEncoder`, `TerrainHead`/`BiomeHead`, and train `imaginator-low_intensity-no_structures` end-to-end | M12 | DONE |
 | M14 | Structure Template Library | Author the initial `mod/common/src/main/resources/structures/` room + redstone template set, including WFC connector-socket declarations, that `structure_graph` output will reference | M9 | PLANNED |
 | M15 | Structure-Graph Model | Add `StructureGraphHead`/`StructureGraphLoss` + WFC constraint pass, train `imaginator-high_intensity-intricate_structures` against the M14 library — the castle benchmark | M13, M14 | PLANNED |
 | M16 | Structure Placement Determinism | Implement seeded `hash(seed, region_x, region_z)` candidate-site placement (`structure_spacing_regions`) and the `StructureRegistry` cache — makes structure discovery order-independent | M10 | PLANNED |

@@ -1,23 +1,38 @@
-# Default training configuration
+# Training configuration for imaginator-low_intensity-no_structures (docs/poc-plan.md Phase 5)
 
 model:
-  embed_dim: 256
-  num_heads: 8
-  num_layers: 6
-  vocab_size: 50000
+  checkpoint_dir: null  # null -> PromptEncoder uses its own absolute default (model/checkpoints/all-MiniLM-L6-v2), independent of cwd
+  halo: 4
+  patch: 16
+  conv_channels: 128
+  num_conv_layers: 4
+  fusion_hidden: 256
+  fusion_out: 128
+  seed_freqs: 32
+  seed_embed_dim: 64
+  num_profiles: 8
+  num_biomes: 8
 
 training:
-  batch_size: 32
-  learning_rate: 0.0001
-  num_epochs: 100
-  checkpoint_dir: "./checkpoints"
+  batch_size: 64
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  num_epochs: 15
+  warmup_steps: 200
+  checkpoint_dir: "./training_runs/run1"
+  log_every: 50
+  val_every_epochs: 1
+  qualitative_dump_every_epochs: 1
+  seed: 1234
 
 data:
   data_dir: "./data"
-  max_prompt_length: 64
-  augmentation: true
+  chunks_per_region: 100
+  max_prompt_length: 128
+  augmentation: false  # see data/labeler.py's maybe_paraphrase — documented no-op, no LLM API available
+  val_region_fraction: 0.08
 
 hardware:
-  device: "auto"
-  num_workers: 4
-  mixed_precision: true
+  device: "mps"
+  num_workers: 0
+  mixed_precision: false

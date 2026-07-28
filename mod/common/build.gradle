@@ -12,4 +12,9 @@ dependencies {
 
 test {
     useJUnitPlatform()
+    // ModelLoader.discoverModels() scans the whole mcimagine/models directory and runs a trial
+    // inference against every .mcim it finds (see docs/model-spec.md's manifest min_ram_mb) — once
+    // a real-sized trained model (~86MB, min_ram_mb: 2048) sits alongside the tiny dummy fixture,
+    // the JVM's 512m default test heap is no longer enough (this OOM'd before this was added).
+    maxHeapSize = "2g"
 }

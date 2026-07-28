@@ -22,7 +22,7 @@ Mc-Imagine is a two-part system that revolutionizes Minecraft world generation b
 ### For Players
 1. **Install the Mod**: Download the appropriate `.jar` (Fabric or Forge) for Minecraft 1.20.1 from the releases page.
 2. **Download a Model**: Get a `.mcim` model file.
-3. **Drop in Folder**: Place the `.mcim` file in your `.minecraft/mcimagine_models` directory.
+3. **Drop in Folder**: Place the `.mcim` file in your `mcimagine/models` directory (relative to the game's run directory, e.g. `.minecraft/mcimagine/models` for the vanilla launcher, or `mod/fabric/run/mcimagine/models` when running from source).
 4. **Create a World**: Launch the game, select the "Mc-Imagine" world type, enter your prompt, and start playing!
 
 ### For Developers
@@ -45,7 +45,7 @@ pip install -r requirements.txt
 
 #### Project Structure
 - `mod/` - Architectury Minecraft mod source code
-- `pipeline/` - Python training pipeline for generating models
+- `model/` - Python training pipeline (`model/src/mc_imagine_model/`: data, model, training, export) for producing `.mcim` models
 - `docs/` - Technical documentation
 
 ## Roadmap

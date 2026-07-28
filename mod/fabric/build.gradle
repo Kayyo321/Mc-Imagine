@@ -20,6 +20,10 @@ dependencies {
     modApi "net.fabricmc.fabric-api:fabric-api:${rootProject.fabric_api_version}"
     modApi "dev.architectury:architectury-fabric:${rootProject.architectury_version}"
 
+    // Bundle the ONNX Runtime jar directly into the built mod jar (Loom's `include`), so a distributed
+    // build carries the runtime rather than only having it on the dev-time classpath (Phase 0 gate).
+    include(implementation("com.microsoft.onnxruntime:onnxruntime:1.19.2"))
+
     common(project(path: ":common", configuration: "namedElements")) { transitive false }
     shadowCommon(project(path: ":common", configuration: "transformProductionFabric")) { transitive false }
 }

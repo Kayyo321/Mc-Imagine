@@ -31,7 +31,10 @@ public class McImaginePresetEditor {
             java.util.Map<Optional<ResourceKey<WorldPreset>>, PresetEditor> mutableEditors = new java.util.HashMap<>(PresetEditor.EDITORS);
             mutableEditors.put(
                     Optional.of(IMAGINE_PRESET),
-                    (createWorldScreen, worldCreationContext) -> new McImagineCustomizeScreen(createWorldScreen)
+                    // Previously dropped worldCreationContext entirely - it's needed to resolve the
+                    // biome/noise-settings registries and to install the new generator via
+                    // WorldCreationUiState.updateDimensions on "Done" (docs/poc-plan.md Phase 2).
+                    (createWorldScreen, worldCreationContext) -> new McImagineCustomizeScreen(createWorldScreen, worldCreationContext)
             );
 
             java.lang.reflect.Field editorsField = PresetEditor.class.getDeclaredField("EDITORS"); // Mojang mapping name is EDITORS (or we can use mapping resolver if needed, but in dev it's EDITORS)

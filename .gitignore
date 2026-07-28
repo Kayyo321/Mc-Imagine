@@ -43,6 +43,9 @@ ehthumbs.db
 data/raw/
 data/processed/
 *.sqlite3
+model/data/
+model/checkpoints/
+model/training_runs/
 
 # Logs
 *.log
@@ -56,3 +59,4 @@ mod/fabric/run/
 
 # Agent orchestration scratch state (not project source)
 .agents/
+.claude/

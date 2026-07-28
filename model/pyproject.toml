@@ -11,11 +11,17 @@ license = {text = "GPL-3.0-only"}
 dependencies = [
     "torch>=2.0",
     "numpy",
+    "scipy",
     "onnx",
     "onnxruntime",
     "tqdm",
     "pyyaml",
-    "pillow"
+    "pillow",
+    "matplotlib",
+    "transformers>=4.40.0",
+    "tokenizers>=0.19.0",
+    "safetensors>=0.4.0",
+    "huggingface_hub>=0.20.0"
 ]
 
 [project.optional-dependencies]
