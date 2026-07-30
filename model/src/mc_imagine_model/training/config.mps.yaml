@@ -31,6 +31,11 @@ training:
   terrain_weight: 1.0
   biome_weight: 1.0
   slope_weight: 1.0  # weight of TerrainLoss's finite-difference slope term (Phase 2 slope-aware loss)
+  # Weight of ReliefLoss — matches the AMOUNT of within-chunk relief rather than its pointwise
+  # value. Without it, flat terrain is the MSE optimum whenever the per-cell slope is unpredictable
+  # (see losses.ReliefLoss). Kept identical to config.cuda.yaml so the two devices train the same
+  # objective and their curves stay comparable.
+  relief_weight: 10.0
   checkpoint_dir: "training_runs/mps_run1"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
   log_every: 50

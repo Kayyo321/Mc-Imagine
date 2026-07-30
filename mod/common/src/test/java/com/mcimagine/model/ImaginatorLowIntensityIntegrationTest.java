@@ -42,7 +42,11 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 public class ImaginatorLowIntensityIntegrationTest {
 
-    private static final String MODEL_FILE = "imaginator-low_intensity-no_structures-1.0.0.mcim";
+    // Phase 2 re-ranged the terrain head and grew the biome palette, so the retrained artefact is a new
+    // generation and docs/TRAINING.md §5 exports it as 1.1.0. This constant tracked the Day-1 1.0.0 name,
+    // which meant a correctly-named Phase 2 export left every test in this class silently skipped — the
+    // coverage would have looked healthy while validating nothing.
+    private static final String MODEL_FILE = "imaginator-low_intensity-no_structures-1.1.0.mcim";
 
     /**
      * Phase 2 grew {@code capabilities.biome_palette} from 8 to 12 entries (docs/phase2-plan.md §2

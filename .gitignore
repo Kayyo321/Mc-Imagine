@@ -3,6 +3,10 @@ build/
 .gradle/
 *.class
 *.jar
+# ...but the Gradle wrapper jar MUST be committed: it is what makes `./gradlew` work on a
+# fresh clone. Without this negation `*.jar` swallows it and every clone fails with
+# "Unable to access jarfile .../gradle-wrapper.jar" before Gradle even starts.
+!**/gradle/wrapper/gradle-wrapper.jar
 bin/
 out/
 

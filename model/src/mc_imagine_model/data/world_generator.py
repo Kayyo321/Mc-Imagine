@@ -165,10 +165,16 @@ class RegionParams:
 # benchmark prompts each map onto (or very near) one of these, so the labeler's caption vocabulary
 # and the world_generator's actual rendered terrain stay in lockstep. See data/labeler.py for the
 # caption templates keyed to the same archetype names.
+#
+# `relief_frequency` is PINNED per archetype (lo == hi), and that is load-bearing — see
+# `sample_params` for the full argument. Briefly: it is the one sampled parameter the caption cannot
+# describe and the seed cannot reveal, and averaging a fixed-phase noise field over a range of
+# frequencies annihilates its structure, so a randomized frequency makes flat terrain the
+# MSE-optimal answer. `tests/test_model.py` asserts every range here stays degenerate.
 ARCHETYPES: Dict[str, Dict[str, Any]] = {
     "valley_mountains_craters": dict(
         biome_choices=[0, 2], profile=4, base_profile=0,
-        base_height=(84, 118), relief_amplitude=(64, 104), relief_frequency=(3.0, 6.5),
+        base_height=(84, 118), relief_amplitude=(64, 104), relief_frequency=(4.75, 4.75),
         ridge_sharpness=(0.60, 0.95), plateau_quantization=(0.0, 0.2),
         water_level=(55, 74), erosion=(0.65, 0.95),
     ),
@@ -177,20 +183,20 @@ ARCHETYPES: Dict[str, Dict[str, Any]] = {
     # level (63) while the ridges stay tall — the biggest vertical range of any archetype.
     "deep_canyon": dict(
         biome_choices=[8, 9, 5], profile=4, base_profile=3,
-        base_height=(96, 130), relief_amplitude=(92, 132), relief_frequency=(2.2, 4.5),
+        base_height=(96, 130), relief_amplitude=(92, 132), relief_frequency=(3.35, 3.35),
         ridge_sharpness=(0.45, 0.85), plateau_quantization=(0.25, 0.65),
         water_level=(18, 44), erosion=(0.75, 1.0),
     ),
     # Phase 2: drowned glacial valleys — steep walls plunging straight into deep water.
     "fjord_rift": dict(
         biome_choices=[7, 6, 10], profile=4, base_profile=2,
-        base_height=(78, 104), relief_amplitude=(74, 116), relief_frequency=(2.6, 5.2),
+        base_height=(78, 104), relief_amplitude=(74, 116), relief_frequency=(3.9, 3.9),
         ridge_sharpness=(0.65, 1.0), plateau_quantization=(0.0, 0.15),
         water_level=(56, 68), erosion=(0.7, 1.0),
     ),
     "desert_dunes": dict(
         biome_choices=[1], profile=1, base_profile=1,
-        base_height=(58, 74), relief_amplitude=(3, 12), relief_frequency=(2.0, 4.0),
+        base_height=(58, 74), relief_amplitude=(3, 12), relief_frequency=(3.0, 3.0),
         ridge_sharpness=(0.0, 0.15), plateau_quantization=(0.0, 0.25),
         water_level=(-20, 20), erosion=(0.0, 0.15),
     ),
@@ -202,13 +208,13 @@ ARCHETYPES: Dict[str, Dict[str, Any]] = {
     # of peak height and buys a summit that actually has relief on it.
     "snow_peaks": dict(
         biome_choices=[3, 10], profile=4, base_profile=2,
-        base_height=(100, 140), relief_amplitude=(72, 100), relief_frequency=(3.5, 7.0),
+        base_height=(100, 140), relief_amplitude=(72, 100), relief_frequency=(5.25, 5.25),
         ridge_sharpness=(0.70, 1.0), plateau_quantization=(0.0, 0.15),
         water_level=(40, 56), erosion=(0.3, 0.55),
     ),
     "tropical_archipelago": dict(
         biome_choices=[7, 11], profile=1, base_profile=1,
-        base_height=(46, 60), relief_amplitude=(20, 38), relief_frequency=(3.0, 6.0),
+        base_height=(46, 60), relief_amplitude=(20, 38), relief_frequency=(4.5, 4.5),
         ridge_sharpness=(0.0, 0.25), plateau_quantization=(0.0, 0.1),
         water_level=(50, 62), erosion=(0.1, 0.3),
     ),
@@ -216,31 +222,31 @@ ARCHETYPES: Dict[str, Dict[str, Any]] = {
     # Day-1 red-mesa world sprout vanilla savanna lakes — see docs/phase2-plan.md §0).
     "mesa_plateaus": dict(
         biome_choices=[8, 9], profile=3, base_profile=3,
-        base_height=(72, 104), relief_amplitude=(28, 62), relief_frequency=(2.5, 5.0),
+        base_height=(72, 104), relief_amplitude=(28, 62), relief_frequency=(3.75, 3.75),
         ridge_sharpness=(0.3, 0.6), plateau_quantization=(0.6, 1.0),
         water_level=(28, 46), erosion=(0.5, 0.8),
     ),
     "rolling_grassland": dict(
         biome_choices=[0], profile=0, base_profile=0,
-        base_height=(58, 76), relief_amplitude=(5, 18), relief_frequency=(1.5, 3.0),
+        base_height=(58, 76), relief_amplitude=(5, 18), relief_frequency=(2.25, 2.25),
         ridge_sharpness=(0.0, 0.2), plateau_quantization=(0.0, 0.1),
         water_level=(44, 60), erosion=(0.1, 0.3),
     ),
     "swamp": dict(
         biome_choices=[4], profile=5, base_profile=5,
-        base_height=(58, 70), relief_amplitude=(3, 9), relief_frequency=(1.5, 3.0),
+        base_height=(58, 70), relief_amplitude=(3, 9), relief_frequency=(2.25, 2.25),
         ridge_sharpness=(0.0, 0.15), plateau_quantization=(0.0, 0.05),
         water_level=(48, 60), erosion=(0.2, 0.4),
     ),
     "taiga_forest": dict(
         biome_choices=[6], profile=7, base_profile=7,
-        base_height=(64, 86), relief_amplitude=(14, 36), relief_frequency=(2.0, 4.0),
+        base_height=(64, 86), relief_amplitude=(14, 36), relief_frequency=(3.0, 3.0),
         ridge_sharpness=(0.2, 0.5), plateau_quantization=(0.0, 0.2),
         water_level=(48, 60), erosion=(0.2, 0.45),
     ),
     "savanna_plains": dict(
         biome_choices=[5], profile=0, base_profile=0,
-        base_height=(60, 80), relief_amplitude=(8, 22), relief_frequency=(1.8, 3.5),
+        base_height=(60, 80), relief_amplitude=(8, 22), relief_frequency=(2.65, 2.65),
         ridge_sharpness=(0.0, 0.25), plateau_quantization=(0.0, 0.15),
         water_level=(40, 55), erosion=(0.15, 0.35),
     ),
@@ -288,7 +294,40 @@ class ProceduralWorldSource:
         """Samples one macro-region's parameter vector, deterministic given (seed, region_x,
         region_z). Picks an archetype, jitters within its ranges, and — 25% of the time — blends
         toward a second archetype for extra diversity so the model doesn't just memorize 9
-        discrete clusters."""
+        discrete clusters.
+
+        **`relief_frequency` is pinned per archetype and excluded from the blend.** This is the
+        third time this project has shipped flat terrain for the same underlying reason, so the
+        argument is written out in full:
+
+        The network only ever sees `(caption, chunk coords, world seed)`. The seed enters
+        `render_region` solely as `seed_to_offset(seed)` — a *translation* of one canonical noise
+        field — so the phase is recoverable. The parameters are not: they come from `stream=0`
+        while the world seed comes from `stream=1`, decorrelated on purpose (see `_region_rng`).
+        The caption names an archetype and coarse amplitude/erosion buckets, nothing more.
+
+        Under MSE the network's optimal output is therefore `E[height | caption, coords, seed]`,
+        averaged over whatever it cannot determine. Measured, per parameter, as the fraction of
+        within-chunk relief surviving that average:
+
+            amplitude only        ~100%      erosion only          ~100%
+            ridge + plateau     83-100%      frequency only       20-37%   <-- annihilates it
+
+        Amplitude, erosion, ridge and plateau all *rescale or reshape a fixed pattern*, so the
+        average keeps its structure. Frequency changes *which* pattern is drawn, so averaging over
+        a 2x frequency range decorrelates the fields being averaged and the mean flattens out.
+        With frequency randomized the ceiling on achievable relief is ~25% of target; with it
+        pinned, ~85-100%.
+
+        Day 1 hit this with a per-region reseeded gradient table (fixed by the canonical field +
+        seed offset, `spec_constants.seed_to_offset`). Phase 2 hit it again through a loss-scale
+        imbalance that made the slope term a no-op. This is the same failure's third channel.
+
+        Diversity is unaffected in the way that matters: a different seed still translates the
+        field to a genuinely different landscape, and amplitude/erosion/ridge/plateau/base_height
+        all still vary freely. Only feature *scale* is now fixed per archetype — which is arguably
+        correct, since "mesa" and "snow peaks" describe characteristic feature sizes.
+        """
         rng = _region_rng(self.seed, region_x, region_z, stream=0)  # archetype + params only
         seed_rng = _region_rng(self.seed, region_x, region_z, stream=1)  # world seed only
         world_seed = int(seed_rng.integers(1, 2**62 - 1))
@@ -313,6 +352,13 @@ class ProceduralWorldSource:
                 other = draw(ARCHETYPES[secondary])
                 blend_weight = float(rng.uniform(0.15, 0.45))
                 for key in values:
+                    # `relief_frequency` is deliberately NOT blended — it keeps the primary
+                    # archetype's pinned value. See the note below on why it is the one parameter
+                    # that must stay a function of the caption alone: blending it here would
+                    # reintroduce a caption-invisible frequency for ~25% of regions, which is
+                    # exactly the hole this pinning exists to close.
+                    if key == "relief_frequency":
+                        continue
                     values[key] = (1 - blend_weight) * values[key] + blend_weight * other[key]
 
         biome_class = int(rng.choice(spec["biome_choices"]))
