@@ -76,7 +76,11 @@ def main():
         opset_version=17,
         dynamic_axes={
             "prompt_tokens": {0: "batch_size"},
-        }
+        },
+        # Match export/export_onnx.py: the legacy TorchScript exporter. From torch 2.9 the default
+        # flipped to the dynamo exporter, which pulls in `onnxscript` (not a project dependency) and
+        # emits a differently-structured graph than the fixture's Java-side tests expect.
+        dynamo=False,
     )
 
     print("Re-saving ONNX model as self-contained file (save_as_external_data=False)...")

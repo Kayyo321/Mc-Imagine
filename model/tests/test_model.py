@@ -3,10 +3,12 @@ Basic pytest tests for the Mc-Imagine model components.
 """
 
 import random
+from typing import Dict
 
 import torch
 import pytest
 
+from mc_imagine_model.data.world_generator import ARCHETYPES, ProceduralWorldSource
 from mc_imagine_model.model.imagine_net import ImagineNet, _check_conv_arithmetic
 from mc_imagine_model.model.text_encoder import PromptEncoder
 from mc_imagine_model.model.positional import (
@@ -26,7 +28,7 @@ from mc_imagine_model.spec_constants import (
     seed_to_offset,
 )
 from mc_imagine_model.tokenizer_utils import tokenize
-from mc_imagine_model.training.losses import TerrainLoss
+from mc_imagine_model.training.losses import ReliefLoss, TerrainLoss
 
 # A small-but-valid config: halo must equal num_conv_layers (each valid 3x3 conv eats one ring),
 # see imagine_net._check_conv_arithmetic.
@@ -337,6 +339,104 @@ def test_terrain_loss_penalizes_flat_prediction() -> None:
     loss = with_slope(preds_for(h), targets)
     loss.backward()
     assert torch.isfinite(loss) and h.grad is not None and torch.any(h.grad != 0)
+
+    # REGRESSION GUARD #2 — the one the slope term itself failed.
+    #
+    # A slope penalty > 0 is NOT sufficient to stop flat terrain, which is why the guard above was
+    # not enough. Slope MSE is a *pointwise* expectation, so when the per-cell slope is
+    # unpredictable from (caption, coords, seed) its optimal value is zero and flat remains the
+    # best available answer — measured end-to-end: within-chunk relief peaked at 19% of target by
+    # step 750 and collapsed to 6% by step 2500, on train and val alike.
+    #
+    # ReliefLoss is the term whose optimum is NOT zero. Assert a flat prediction is penalized in
+    # proportion to how much relief it is failing to produce, so no future refactor can reduce this
+    # to another pointwise term.
+    relief = ReliefLoss()
+    flat_relief = relief(preds_for(flat), targets)
+    perfect_relief = relief(preds_for(target_h), targets)
+
+    assert perfect_relief.item() < 1e-9, "a correct prediction must incur no relief penalty"
+    assert flat_relief.item() > 0.1, (
+        f"flat prediction incurs relief penalty {flat_relief.item():.3e}, which is too small to "
+        f"outrun the pointwise terms — ReliefLoss has been scaled into irrelevance"
+    )
+
+    # And it must be strictly monotone in how flat the prediction is: a half-amplitude prediction
+    # has to cost less than a fully flat one, otherwise the term gives no gradient to climb.
+    half = flat + 0.5 * (target_h - flat)
+    assert relief(preds_for(half), targets).item() < flat_relief.item()
+
+    # Differentiable, and the gradient actually pushes toward MORE relief.
+    #
+    # A bit-exactly constant prediction is a stationary point: `std` is a function of |deviation|,
+    # so at zero deviation autograd yields exactly zero gradient. That is inherent to any
+    # magnitude-matching term, and benign — the point is measure-zero and unstable, and a real conv
+    # stack never emits a bit-exactly constant patch (measured within-chunk std 0.006 at init,
+    # 0.056 even in the fully collapsed model). Assert the realistic case instead, and assert the
+    # gradient points the right way rather than merely existing.
+    #
+    # The perturbation must clear float32's ULP at terrain magnitudes (~1.15e-5 at y=96) or it is
+    # silently rounded away and the tensor stays bit-exactly flat — 1e-2 is both safely above that
+    # and squarely in the range a real collapsed model produces.
+    h2 = (flat + 1e-2 * torch.randn_like(flat)).clone().requires_grad_(True)
+    relief(preds_for(h2), targets).backward()
+    assert h2.grad is not None and torch.any(h2.grad != 0)
+
+    deviation = h2.detach() - h2.detach().mean(dim=(1, 2), keepdim=True)
+    # -grad is the descent direction; it must correlate positively with the existing deviation,
+    # i.e. descending this loss AMPLIFIES whatever relief is already there.
+    assert float((-h2.grad * deviation).sum()) > 0.0, (
+        "ReliefLoss gradient does not amplify existing relief — the term would be pushing the "
+        "model toward flatter terrain, not away from it"
+    )
+
+    # And the exactly-flat stationary point is documented, not accidental.
+    h3 = flat.clone().requires_grad_(True)
+    relief(preds_for(h3), targets).backward()
+    assert torch.all(h3.grad == 0), (
+        "an exactly-flat prediction is expected to be a stationary point of ReliefLoss; if this "
+        "now has gradient, the term changed shape and the docstring needs updating"
+    )
+
+
+def test_relief_frequency_is_pinned_per_archetype() -> None:
+    """`relief_frequency` must stay a pure function of the archetype (hence of the caption).
+
+    It is the one sampled parameter the caption cannot describe and the world seed cannot reveal —
+    `sample_params` draws parameters from `_region_rng(..., stream=0)` and the world seed from
+    `stream=1`, decorrelated on purpose. Randomizing it makes flat terrain the MSE optimum:
+    averaging a fixed-phase noise field over a range of frequencies decorrelates the fields being
+    averaged and annihilates their structure. Measured, as the fraction of within-chunk relief
+    surviving conditional averaging:
+
+        amplitude only ~100%   erosion only ~100%   ridge+plateau 83-100%   frequency only 20-37%
+
+    So amplitude/erosion/ridge/plateau may keep varying freely; frequency may not. This test fails
+    loudly if a future edit widens a range or blends the value away, instead of the world silently
+    going flat again.
+    """
+    for name, spec in ARCHETYPES.items():
+        lo, hi = spec["relief_frequency"]
+        assert lo == hi, (
+            f"archetype {name!r} has relief_frequency=({lo}, {hi}); it must be pinned (lo == hi) "
+            f"or flat terrain becomes the loss optimum again"
+        )
+
+    # The 25% secondary-archetype blend in `sample_params` must also leave it alone: the caption is
+    # keyed to the PRIMARY archetype, so a blended frequency is caption-invisible and reopens the
+    # same hole for a quarter of all regions.
+    src = ProceduralWorldSource(seed=1234)
+    seen: Dict[str, set] = {}
+    for region_id in range(1500):
+        params = src.sample_params(region_id % 64, region_id // 64)
+        seen.setdefault(params.archetype, set()).add(round(params.relief_frequency, 9))
+
+    leaked = {a: sorted(v) for a, v in seen.items() if len(v) > 1}
+    assert not leaked, (
+        f"these archetypes produced more than one relief_frequency across sampled regions, so the "
+        f"secondary-archetype blend is leaking it: {leaked}"
+    )
+    assert len(seen) >= 8, f"only {len(seen)} archetypes sampled; test is not covering enough"
 
 
 def test_verify_coordinate_purity_matches_export_path() -> None:

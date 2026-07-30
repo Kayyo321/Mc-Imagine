@@ -360,6 +360,7 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
         terrain_weight=train_cfg.get("terrain_weight", 1.0),
         biome_weight=train_cfg.get("biome_weight", 1.0),
         slope_weight=train_cfg.get("slope_weight", 1.0),
+        relief_weight=train_cfg.get("relief_weight", 0.0),
         structure_weight=0.0,
         structure_graph_weight=0.0,
     )

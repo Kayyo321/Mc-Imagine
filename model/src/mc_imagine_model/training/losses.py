@@ -99,6 +99,66 @@ class TerrainLoss(nn.Module):
         )
 
 
+class ReliefLoss(nn.Module):
+    """
+    Matches the *amount* of relief in a chunk, not its pointwise value.
+
+    Every other terrain term is a **pointwise conditional expectation**, and that is precisely why
+    each one has independently permitted flat terrain:
+
+        height MSE  ->  optimum is E[height | inputs]
+        slope  MSE  ->  optimum is E[slope  | inputs]
+
+    The network sees only `(caption, chunk coords, world seed)`. `data/world_generator.py` draws a
+    region's parameters from `_region_rng(..., stream=0)` while the world seed comes from
+    `stream=1`, decorrelated deliberately, and the caption names an archetype plus coarse
+    amplitude/erosion buckets. Anything not determined by those inputs is, from the network's point
+    of view, noise — and **the MSE-optimal guess for an unpredictable signed quantity is zero**.
+    So an unpredictable slope field is best answered with no slope at all: flat.
+
+    This is the trap the Phase 2 slope term walked into. It was added because "absolute-height MSE
+    alone is exactly what let the Day-1 model win by being *smooth*" (see `TerrainLoss` above), but
+    MSE-on-slopes penalizes *wrong* slopes, which leaves predicting *no* slope the safe play. It
+    changed which quantity was being pointwise-averaged, not the character of the objective.
+
+    Per-chunk standard deviation is a **magnitude**, so its optimum is not zero, and it is a
+    statistic the caption genuinely determines (measured: amplitude/erosion/ridge/plateau all
+    retain 83-100% of relief under conditional averaging — only *phase* is unrecoverable). A model
+    that emits correctly-scaled relief in the wrong places is penalized here far less than a flat
+    one, which is exactly the trade that produces terrain instead of a plateau.
+
+    Expects `preds["heightmap"]` and `targets["heightmap"]`, both [B,16,16].
+
+    NOTE: this deliberately makes the *pointwise* slope metric worse (measured +0.0192 vs +0.0034
+    against a flat-prediction baseline) while making the terrain better. Judge this model on
+    within-chunk height std against target, never on slope MSE alone.
+
+    KNOWN PROPERTY — an *exactly* constant prediction is a stationary point of this term: `std` is
+    a function of |deviation|, so at zero deviation its derivative is 0/0 and autograd yields
+    exactly zero gradient. This is inherent to every magnitude-matching loss, not a bug here, and
+    it is benign: the point is measure-zero and unstable (it is a local *maximum* of this term),
+    and a real conv stack never emits a bit-exactly constant patch — measured within-chunk std is
+    0.006 at init and 0.056 even in the fully collapsed model, both far above float32's ULP at
+    terrain magnitudes (~1.15e-5 at y=96, below which a perturbation is simply rounded away). Once
+    any deviation above that threshold exists, the gradient is correctly directed and its
+    magnitude is stable across several orders of magnitude of deviation.
+    `tests/test_model.py` pins this behaviour deliberately.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+        pred_h = preds["heightmap"]
+        target_h = targets["heightmap"]
+        # std over each chunk's 16x16 columns -> [B]; same HEIGHT_SCALE normalization every other
+        # height-valued term uses, so `relief_weight` is comparable to the other weights.
+        pred_std = pred_h.reshape(pred_h.shape[0], -1).std(dim=1)
+        target_std = target_h.reshape(target_h.shape[0], -1).std(dim=1)
+        return self.mse(pred_std / TerrainLoss.HEIGHT_SCALE, target_std / TerrainLoss.HEIGHT_SCALE)
+
+
 class BiomeLoss(nn.Module):
     """
     Cross-entropy loss for biome prediction, over the quarter-resolution `biome_grid` classes.
@@ -194,15 +254,21 @@ class CombinedLoss(nn.Module):
         structure_weight: float = 0.0,
         structure_graph_weight: float = 0.0,
         slope_weight: float = 1.0,
+        relief_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.terrain_loss = TerrainLoss(slope_weight=slope_weight)
         self.biome_loss = BiomeLoss()
+        self.relief_loss = ReliefLoss()
         self.structure_loss = StructureLoss()
         self.structure_graph_loss = StructureGraphLoss()
 
         self.terrain_weight = terrain_weight
         self.biome_weight = biome_weight
+        # Defaults to 0.0 so an out-of-date config (or the collaborator's checkout before they pull)
+        # reproduces the previous behaviour exactly rather than silently training a different
+        # objective. Both shipped configs set it to 10.0.
+        self.relief_weight = relief_weight
         self.structure_weight = structure_weight
         self.structure_graph_weight = structure_graph_weight
 
@@ -210,6 +276,9 @@ class CombinedLoss(nn.Module):
         loss_t = self.terrain_loss(preds, targets)
         loss_b = self.biome_loss(preds, targets)
         total_loss = self.terrain_weight * loss_t + self.biome_weight * loss_b
+
+        if self.relief_weight > 0.0:
+            total_loss = total_loss + self.relief_weight * self.relief_loss(preds, targets)
 
         if self.structure_weight > 0.0:
             total_loss = total_loss + self.structure_weight * self.structure_loss(preds, targets)

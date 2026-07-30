@@ -31,22 +31,17 @@ training:
   batch_size: 256
   learning_rate: 0.0006  # scaled with the 4x larger batch vs. config.mps.yaml
   weight_decay: 0.01
-  num_epochs: 60
+  num_epochs: 1
   warmup_steps: 500
   grad_clip_norm: 1.0
   terrain_weight: 1.0
   biome_weight: 1.0
   slope_weight: 1.0  # weight of TerrainLoss's finite-difference slope term (Phase 2 slope-aware loss)
-  # Weight of ReliefLoss — matches the AMOUNT of within-chunk relief rather than its pointwise
-  # value. Without it, flat terrain is the MSE optimum whenever the per-cell slope is unpredictable
-  # (see losses.ReliefLoss). Measured at this weight: relief holds ~21% of target across training
-  # instead of peaking at 19% by step 750 and collapsing to 6%.
-  relief_weight: 10.0
-  checkpoint_dir: "training_runs/cuda_run3"  # relative paths resolve against model/ (see train.resolve_path)
+  checkpoint_dir: "training_runs/rehearsal"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
   log_every: 50
   val_every_epochs: 1
-  qualitative_dump_every_epochs: 5  # the PNG dump runs 6 prompts x 8x8 chunks on-device; less often on long runs
+  qualitative_dump_every_epochs: 1  # the PNG dump runs 6 prompts x 8x8 chunks on-device; less often on long runs
   target_range_check_batches: 8  # startup assert: all height/water targets inside the head's band
   seed: 1234  # identical to config.mps.yaml — seeding is device-independent so curves are comparable
 
@@ -65,19 +60,5 @@ hardware:
   num_workers: 8
   pin_memory: true
   prefetch_factor: 2
-  # fp16 autocast + GradScaler; CUDA-only, a no-op on any other device.
-  #
-  # DISABLED after the 2026-07-28 8000-region run died of fp16 overflow: GradScaler's scale
-  # collapsed 2048 -> 0.1 -> 0.0, every optimizer step was skipped from epoch 12 on (consecutive
-  # checkpoints byte-identical), and by epoch 16 26/127 weight tensors were NaN. Nothing crashed
-  # and the log kept printing normal-looking progress the whole time, so it burned 9 hours of GPU
-  # producing nothing. train.py's AMP loop is correct (scale -> backward -> unscale_ -> clip ->
-  # step -> update), so this is fp16 numerics, not a code bug.
-  #
-  # The cost of fp32 here is close to zero: this workload is dataloader-bound, not GPU-bound (GPU
-  # sat at 30-60% while all CPU threads were pinned decompressing .npz shards), so fp16 was buying
-  # throughput on a resource that was already idle. Measured 9.15 h for 60 epochs in fp32.
-  #
-  # config.mps.yaml already sets this false (AMP is CUDA-only by policy), so this file is the only
-  # place it mattered.
-  mixed_precision: false
+  mixed_precision: true  # fp16 autocast + GradScaler; CUDA-only, a no-op on any other device
+
