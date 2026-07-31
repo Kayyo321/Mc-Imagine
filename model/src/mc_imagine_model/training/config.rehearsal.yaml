@@ -1,25 +1,23 @@
-# Training configuration — NVIDIA / CUDA. This is the config the real runs use.
+# Training configuration — Fast Rehearsal / Smoke Test (`num_epochs: 1`).
 #
-# The `model:` block is byte-for-byte identical to config.mps.yaml on purpose: the two files differ
-# only in how the machine is driven (device, workers, AMP, batch size, epoch count), never in what
-# is trained. A checkpoint produced here must be exportable and comparable against one produced on
-# the Mac.
+# Paired with `--regions 400 --max-steps 50` for rapid end-to-end pipeline checking.
 #
-#   pip install -r model/requirements.txt          # then the CUDA torch wheel, see that file
+#   pip install -r model/requirements.txt
 #   python -m mc_imagine_model.scripts.bootstrap
-#   python -m mc_imagine_model.scripts.generate_data --regions 8000 --out model/data
+#   python -m mc_imagine_model.scripts.generate_data --regions 400 --out model/data
 #   python -m mc_imagine_model.training.train \
-#     --config model/src/mc_imagine_model/training/config.cuda.yaml
+#     --config model/src/mc_imagine_model/training/config.rehearsal.yaml --max-steps 50
 #
 # Interrupted? Resume without losing the run:
-#   ... --config .../config.cuda.yaml --resume model/training_runs/cuda_run1/last.pt
+#   ... --config .../config.rehearsal.yaml --resume model/training_runs/rehearsal/last.pt
 
 model:
   checkpoint_dir: null  # null -> PromptEncoder uses its own absolute default (model/checkpoints/all-MiniLM-L6-v2), independent of cwd
-  halo: 6
+  halo: 9
   patch: 16
   conv_channels: 192
   num_conv_layers: 6
+  num_conv3d_layers: 3
   fusion_hidden: 512
   fusion_out: 256
   seed_freqs: 32
@@ -37,6 +35,11 @@ training:
   terrain_weight: 1.0
   biome_weight: 1.0
   slope_weight: 1.0  # weight of TerrainLoss's finite-difference slope term (Phase 2 slope-aware loss)
+  relief_weight: 10.0
+  # Phase 4 Gate 2 starting point; sweep before a full release run.
+  occupancy_weight: 1.0
+  overhang_weight: 1.0
+  consistency_weight: 0.25
   checkpoint_dir: "training_runs/rehearsal"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
   log_every: 50
@@ -60,5 +63,5 @@ hardware:
   num_workers: 8
   pin_memory: true
   prefetch_factor: 2
-  mixed_precision: true  # fp16 autocast + GradScaler; CUDA-only, a no-op on any other device
+  mixed_precision: false
 

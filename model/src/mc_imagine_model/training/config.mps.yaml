@@ -10,10 +10,11 @@
 
 model:
   checkpoint_dir: null  # null -> PromptEncoder uses its own absolute default (model/checkpoints/all-MiniLM-L6-v2), independent of cwd
-  halo: 6
+  halo: 9
   patch: 16
   conv_channels: 192
   num_conv_layers: 6
+  num_conv3d_layers: 3
   fusion_hidden: 512
   fusion_out: 256
   seed_freqs: 32
@@ -36,6 +37,10 @@ training:
   # (see losses.ReliefLoss). Kept identical to config.cuda.yaml so the two devices train the same
   # objective and their curves stay comparable.
   relief_weight: 10.0
+  # Phase 4 Gate 2 starting point; sweep before a full release run.
+  occupancy_weight: 1.0
+  overhang_weight: 1.0
+  consistency_weight: 0.25
   checkpoint_dir: "training_runs/mps_run1"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
   log_every: 50

@@ -5,7 +5,7 @@ Custom loss functions for Mc-Imagine model training.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Tuple
 
 from mc_imagine_model.spec_constants import HEIGHT_LOSS_SCALE, SLOPE_LOSS_SCALE
 
@@ -237,6 +237,87 @@ class MacroFieldLoss(nn.Module):
         return torch.tensor(0.0, requires_grad=True)
 
 
+class OccupancyLoss(nn.Module):
+    """
+    Weighted Binary Cross-Entropy loss for 3D occupancy prediction.
+    Focuses weight on solid/air transition boundaries in the target band.
+    """
+
+    def __init__(self, transition_weight: float = 5.0) -> None:
+        super().__init__()
+        self.transition_weight = transition_weight
+
+    def forward(self, pred_logits: torch.Tensor, target_band: torch.Tensor) -> torch.Tensor:
+        # pred_logits: [B, 64, 16, 16], target_band: [B, 64, 16, 16] (0.0 or 1.0)
+        target = target_band.float()
+        # Compute transition mask along y-axis (dim 1)
+        dy = torch.zeros_like(target)
+        dy[:, :-1, :, :] = torch.abs(target[:, 1:, :, :] - target[:, :-1, :, :])
+        weight = 1.0 + self.transition_weight * dy
+        return F.binary_cross_entropy_with_logits(pred_logits, target, weight=weight)
+
+
+class OverhangLoss(nn.Module):
+    """
+    Differentiable MSE matching predicted per-chunk overhang cell count against target.
+    Calculates overhang cells as air cells with solid material above them in the band.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, pred_logits: torch.Tensor, target_band: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(pred_logits)  # [B, 64, 16, 16]
+        target = target_band.float()
+
+        # Differentiable cumulative max along y (from top y=63 down to y=0)
+        flipped_probs = torch.flip(probs, dims=[1])
+        cummax_probs, _ = torch.cummax(flipped_probs, dim=1)
+        solid_above = torch.flip(cummax_probs, dims=[1])
+        # Shift down: level y sees max of levels > y
+        solid_above_shifted = torch.zeros_like(solid_above)
+        solid_above_shifted[:, :-1, :, :] = solid_above[:, 1:, :, :]
+
+        # Overhang probability per cell: air * solid_above
+        p_overhang = (1.0 - probs) * solid_above_shifted
+        pred_overhang_count = p_overhang.sum(dim=(1, 2, 3)) / (16.0 * 16.0)
+
+        # Target overhang count
+        target_flipped = torch.flip(target, dims=[1])
+        target_cummax, _ = torch.cummax(target_flipped, dim=1)
+        target_solid_above = torch.flip(target_cummax, dims=[1])
+        target_solid_above_shifted = torch.zeros_like(target_solid_above)
+        target_solid_above_shifted[:, :-1, :, :] = target_solid_above[:, 1:, :, :]
+        target_overhang = (1.0 - target) * target_solid_above_shifted
+        target_overhang_count = target_overhang.sum(dim=(1, 2, 3)) / (16.0 * 16.0)
+
+        return self.mse(pred_overhang_count, target_overhang_count)
+
+
+class ConsistencyLoss(nn.Module):
+    """
+    Penalizes gap between predicted heightmap h and the soft-argmax topmost solid cell in the band.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, pred_height: torch.Tensor, pred_logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(pred_logits)  # [B, 64, 16, 16]
+        # Soft-argmax of topmost solid cell along y
+        y_indices = torch.arange(64, device=pred_logits.device, dtype=torch.float32).view(1, 64, 1, 1)
+        soft_topmost = (probs * y_indices).sum(dim=1) / (probs.sum(dim=1) + 1e-6)
+
+        # Map band index to world y elevation delta relative to anchor
+        from mc_imagine_model.spec_constants import BAND_BOTTOM_OFFSET, HEIGHT_LOSS_SCALE
+        pred_surface = BAND_BOTTOM_OFFSET + soft_topmost
+
+        # Compare normalized height delta
+        return self.mse(pred_height / HEIGHT_LOSS_SCALE, (pred_height.detach() + pred_surface) / HEIGHT_LOSS_SCALE)
+
+
 class CombinedLoss(nn.Module):
     """
     Weighted sum of all loss components. `structure_weight`/`structure_graph_weight` default to
@@ -255,6 +336,9 @@ class CombinedLoss(nn.Module):
         structure_graph_weight: float = 0.0,
         slope_weight: float = 1.0,
         relief_weight: float = 0.0,
+        occupancy_weight: float = 0.0,
+        overhang_weight: float = 0.0,
+        consistency_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.terrain_loss = TerrainLoss(slope_weight=slope_weight)
@@ -262,6 +346,9 @@ class CombinedLoss(nn.Module):
         self.relief_loss = ReliefLoss()
         self.structure_loss = StructureLoss()
         self.structure_graph_loss = StructureGraphLoss()
+        self.occupancy_loss = OccupancyLoss()
+        self.overhang_loss = OverhangLoss()
+        self.consistency_loss = ConsistencyLoss()
 
         self.terrain_weight = terrain_weight
         self.biome_weight = biome_weight
@@ -271,17 +358,57 @@ class CombinedLoss(nn.Module):
         self.relief_weight = relief_weight
         self.structure_weight = structure_weight
         self.structure_graph_weight = structure_graph_weight
+        self.occupancy_weight = occupancy_weight
+        self.overhang_weight = overhang_weight
+        self.consistency_weight = consistency_weight
 
-    def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         loss_t = self.terrain_loss(preds, targets)
         loss_b = self.biome_loss(preds, targets)
+        loss_r = self.relief_loss(preds, targets)
+
+        pred_dx, pred_dz = TerrainLoss._slopes(preds["heightmap"] / TerrainLoss.SLOPE_SCALE)
+        target_dx, target_dz = TerrainLoss._slopes(targets["heightmap"] / TerrainLoss.SLOPE_SCALE)
+        loss_s = 0.5 * (F.mse_loss(pred_dx, target_dx) + F.mse_loss(pred_dz, target_dz))
+
+        target_band = targets.get("band", targets.get("occupancy_band", None))
+        if "occupancy_logits" in preds and target_band is not None:
+            loss_occ = self.occupancy_loss(preds["occupancy_logits"], target_band)
+            loss_ovh = self.overhang_loss(preds["occupancy_logits"], target_band)
+        else:
+            loss_occ = torch.tensor(0.0, device=preds["heightmap"].device)
+            loss_ovh = torch.tensor(0.0, device=preds["heightmap"].device)
+
+        if "occupancy_logits" in preds:
+            loss_con = self.consistency_loss(preds["heightmap"], preds["occupancy_logits"])
+        else:
+            loss_con = torch.tensor(0.0, device=preds["heightmap"].device)
+
         total_loss = self.terrain_weight * loss_t + self.biome_weight * loss_b
 
         if self.relief_weight > 0.0:
-            total_loss = total_loss + self.relief_weight * self.relief_loss(preds, targets)
+            total_loss = total_loss + self.relief_weight * loss_r
 
         if self.structure_weight > 0.0:
             total_loss = total_loss + self.structure_weight * self.structure_loss(preds, targets)
         if self.structure_graph_weight > 0.0:
             total_loss = total_loss + self.structure_graph_weight * self.structure_graph_loss(preds, targets)
-        return total_loss
+
+        if self.occupancy_weight > 0.0:
+            total_loss = total_loss + self.occupancy_weight * loss_occ
+        if self.overhang_weight > 0.0:
+            total_loss = total_loss + self.overhang_weight * loss_ovh
+        if self.consistency_weight > 0.0:
+            total_loss = total_loss + self.consistency_weight * loss_con
+
+        components_dict = {
+            "terrain": loss_t,
+            "biome": loss_b,
+            "relief": loss_r,
+            "slope": loss_s,
+            "occupancy": loss_occ,
+            "overhang": loss_ovh,
+            "consistency": loss_con,
+        }
+        return total_loss, components_dict
+

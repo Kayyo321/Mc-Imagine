@@ -34,9 +34,9 @@ class TerrainHead(nn.Module):
     are asserted at training startup. Sharing one definition is what keeps those three places from
     drifting apart again.
 
-    `block_volume` is *not* predicted here — see `data/dataset.py`'s docstring and
-    `export/export_onnx.py`: it's a deterministic `torch.where`-style expansion of
-    (heightmap, profile, water_level) computed once, inside the exported graph.
+    `block_volume` is *not* predicted by this head. In Phase 4 the separate `Occupancy3DHead`
+    predicts the surface-anchored solid/air band, and `export/export_onnx.py` expands that band plus
+    this head's surface profile and water level into the full world-height volume.
     """
 
     def __init__(self, in_channels: int = 128, num_profiles: int = NUM_PROFILES) -> None:
@@ -81,6 +81,55 @@ class BiomeHead(nn.Module):
             torch.Tensor: biome_logits, [B, num_biomes, 4, 4]
         """
         return self.conv(features)
+
+
+class Occupancy3DHead(nn.Module):
+    """
+    Output head for 3D binary occupancy prediction across a 64-block surface-anchored band.
+
+    Consumes [B, in_channels, 22, 22] 2D features from the conv stack:
+      1. Project 1x1 conv2d: in_channels -> 32 * 16 (512 channels)
+      2. Reshape: [B, 32, 16, 22, 22]  (B, C, Y, Z, X)
+      3. 3x Conv3d (kernel 3, valid in x/z, pad 1 in y, GELU): [B, 32, 16, 22, 22] -> [B, 32, 16, 16, 16]
+      4. ConvTranspose3d in y (stride 4): [B, 32, 16, 16, 16] -> [B, 32, 64, 16, 16]
+      5. 1x1x1 Conv3d -> 1 channel, squeeze -> occupancy_logits [B, 64, 16, 16]
+    """
+
+    def __init__(self, in_channels: int = 192, hidden_channels: int = 32, y_in: int = 16, y_out: int = 64) -> None:
+        super().__init__()
+        self.y_in = y_in
+        self.hidden_channels = hidden_channels
+        self.proj_conv = nn.Conv2d(in_channels, hidden_channels * y_in, kernel_size=1)
+
+        self.conv3d_stack = nn.Sequential(
+            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=(1, 0, 0)),
+            nn.GELU(),
+            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=(1, 0, 0)),
+            nn.GELU(),
+            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=(1, 0, 0)),
+            nn.GELU(),
+        )
+        self.y_upsample = nn.ConvTranspose3d(
+            hidden_channels, hidden_channels, kernel_size=(4, 1, 1), stride=(4, 1, 1)
+        )
+        self.out_conv = nn.Conv3d(hidden_channels, 1, kernel_size=1)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features (torch.Tensor): [B, in_channels, 22, 22] feature map.
+
+        Returns:
+            torch.Tensor: occupancy_logits, [B, 64, 16, 16]
+        """
+        b, _, h, w = features.shape
+        x = self.proj_conv(features)  # [B, 32*16, 22, 22]
+        x = x.view(b, self.hidden_channels, self.y_in, h, w)  # [B, 32, 16, 22, 22]
+        x = self.conv3d_stack(x)  # [B, 32, 16, 16, 16]
+        x = self.y_upsample(x)     # [B, 32, 64, 16, 16]
+        logits = self.out_conv(x).squeeze(1)  # [B, 64, 16, 16]
+        return logits
+
 
 
 class StructureHead(nn.Module):

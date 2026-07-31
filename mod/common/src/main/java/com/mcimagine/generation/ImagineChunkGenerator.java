@@ -8,6 +8,7 @@ import com.mcimagine.model.FallbackTerrain;
 import com.mcimagine.model.ModelLoader;
 import com.mcimagine.model.ModelRegistry;
 import com.mcimagine.model.ModelSession;
+import com.mcimagine.model.VolumeFallbackLog;
 import com.mcimagine.prompt.PromptTokenizer;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Replaces vanilla chunk generation with AI-powered generation driven by ONNX model tensors.
@@ -176,7 +178,13 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
             }
         }
 
-        // Fallback session - FallbackTerrain sine-wave terrain, no ONNX graph loaded.
+        // Fallback session - FallbackTerrain sine-wave terrain, no ONNX graph loaded. Logged here, once
+        // per generator, and kept separate from VolumeFallbackLog's model-authored-volume rejection: both
+        // end in heightmap-derived terrain, but "no model was found" and "a model's terrain was thrown
+        // away" are different findings and an operator has to be able to tell them apart in a log.
+        McImagine.LOGGER.warn("ImagineChunkGenerator: no usable model was found (searched {}); generating with " +
+                "the built-in FallbackTerrain engine. Terrain will be the sine-wave placeholder, not model-authored.",
+                modelsDir != null ? modelsDir : "no models directory");
         this.modelSession = new ModelSession();
     }
 
@@ -212,7 +220,7 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
                     .findFirst()
                     .orElse(availableModels.get(0));
             byte[] bytes = loader.extractModelBytes(selected);
-            ModelSession session = new ModelSession(bytes);
+            ModelSession session = new ModelSession(bytes, ModelLoader.formatContract(selected.formatVersion()));
             ModelRegistry.register(selected, session);
             this.modelLoader = loader;
             this.modelInfo = selected;
@@ -232,7 +240,7 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
             ModelInfo info = loader.parseModelInfo(mcimFile);
             if (info != null && info.available()) {
                 byte[] bytes = loader.extractModelBytes(info);
-                ModelSession session = new ModelSession(bytes);
+                ModelSession session = new ModelSession(bytes, ModelLoader.formatContract(info.formatVersion()));
                 ModelRegistry.register(info, session);
                 this.modelLoader = loader;
                 this.modelInfo = info;
@@ -429,14 +437,40 @@ public class ImagineChunkGenerator extends ChunkGenerator implements AutoCloseab
      */
     private record ValidatedVolume(int[] blockVolume, boolean fromFallback) {}
 
+    /** Latches {@link #validateBlockVolume}'s should-not-happen guard; chunks generate on many threads. */
+    private static final AtomicBoolean MALFORMED_FALLBACK_VOLUME_LOGGED = new AtomicBoolean(false);
+
+    /**
+     * Accepts a model-authored {@code block_volume} or replaces it with a heightmap-derived one.
+     *
+     * <p>The replacement is silent in-world - a heightfield volume generates perfectly good terrain,
+     * just terrain with no overhangs - so every rejection of a <em>model-authored</em> volume is
+     * routed to {@link VolumeFallbackLog}, which is loud on first occurrence and throttled after.
+     * docs/phase4-plan.md §8 lists this downgrade as a release risk precisely because the result
+     * looks like a working previous release.
+     *
+     * <p>The two fallback provenances are kept apart by {@link ChunkOutput#blockVolumeFromFallback()}:
+     * when it is already set, no model authored this array, so the rejection is not a model failure
+     * and does not belong in that log. Both {@link FallbackTerrain} producers emit exactly
+     * {@code expectedLength} cells, so that branch is unreachable today and is written as a guard
+     * rather than as an expected case - hence its one-shot latch: it exists to survive a future
+     * {@code FallbackTerrain} change, and a guard that fired once per chunk would be its own incident.
+     */
     private ValidatedVolume validateBlockVolume(ChunkOutput output, int[] heightmap, int chunkX, int chunkZ) {
         int[] raw = output.blockVolume();
         int expectedLength = 16 * FallbackTerrain.HEIGHT_SPAN * 16;
         if (raw == null || raw.length != expectedLength) {
-            if (raw != null && raw.length != 0) {
-                McImagine.LOGGER.warn("ImagineChunkGenerator: chunk ({}, {}) block_volume has {} elements " +
-                        "(expected {}); using heightmap-derived fallback volume for this chunk",
-                        chunkX, chunkZ, raw.length, expectedLength);
+            if (output.blockVolumeFromFallback()) {
+                if (MALFORMED_FALLBACK_VOLUME_LOGGED.compareAndSet(false, true)) {
+                    McImagine.LOGGER.warn("ImagineChunkGenerator: chunk ({}, {}) has a malformed fallback-derived " +
+                            "block_volume ({} elements, expected {}); rebuilding it from the heightmap. This is a " +
+                            "FallbackTerrain bug, not a model one - reported once per process.",
+                            chunkX, chunkZ, raw == null ? -1 : raw.length, expectedLength);
+                }
+            } else {
+                VolumeFallbackLog.heightfieldDowngrade(
+                        raw == null ? VolumeFallbackLog.Cause.VOLUME_NULL : VolumeFallbackLog.Cause.VOLUME_WRONG_LENGTH,
+                        chunkX, chunkZ, raw == null ? -1 : raw.length, expectedLength);
             }
             return new ValidatedVolume(FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap), true);
         }

@@ -29,13 +29,12 @@ class McImagineDataset(Dataset):
     out of the region's (CANVAS x CANVAS) heightfield/profile/biome rasters. `world_generator.py`
     renders those rasters with a HALO_MARGIN border specifically so every chunk position — including
     edge chunks — can be sliced without extra padding; see its module docstring and
-    docs/poc-plan.md §1b. Note what this dataset does *not* need to materialize: `block_volume`.
-    Per docs/poc-plan.md's Phase 6 export design, `block_volume` is a deterministic function of
-    (heightmap, profile, water_level, biome) computed by `torch.where`-style expansion *inside* the
-    exported graph — the network only ever predicts the ~350 scalars per chunk that determine it,
-    not the full 98,304-cell volume. Training therefore only needs heightmap/profile/water/biome
-    ground truth; `block_volume` stays a zero placeholder here (matching `structure_markers`/
-    `structure_graph_*`, which are also zeroed since this is a `structure_support: "none"` model).
+    docs/poc-plan.md §1b. Phase 4 adds the materialized `band` target: each sample carries a
+    `[64,16,16]` surface-anchored occupancy band, because `block_volume` is no longer derivable from
+    `(heightmap, profile, water_level)`. The exporter expands the trained occupancy head into the
+    full `[16,384,16]` `block_volume`; the dataset still leaves `block_volume` itself as a zero
+    placeholder, matching `structure_markers`/`structure_graph_*`, because the full world-height
+    volume is an export artifact rather than a training target.
     """
 
     def __init__(
@@ -120,8 +119,17 @@ class McImagineDataset(Dataset):
             self._shard_cache.move_to_end(path)
             return cached
         with np.load(path) as npz:
+            assert "band" in npz, (
+                path
+                + ": missing 'band' array — stale shard (v1.1.x heightfield format), regenerate with ProceduralWorldSource.generate_shards to include the 64-block occupancy band"
+            )
+            band = npz["band"]
+            assert band.shape == (CANVAS, CANVAS, 64), (
+                path + ": band shape mismatch — stale or corrupted band array"
+            )
             data = {
                 "heightfield": npz["heightfield"],
+                "band": band,
                 "profile_map": npz["profile_map"],
                 "biome_map": npz["biome_map"],
                 "water_level": float(npz["water_level"]),
@@ -185,6 +193,8 @@ class McImagineDataset(Dataset):
         height_core = shard["heightfield"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
         profile_core = shard["profile_map"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
         biome_core = shard["biome_map"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16]
+        band_core = shard["band"][z0 + R : z0 + R + 16, x0 + R : x0 + R + 16, :]
+        band_transposed = np.transpose(band_core, (2, 0, 1))  # [64, 16, 16] (Y, Z, X)
 
         # biome_grid ground truth at quarter resolution (4x4), majority-vote per 4x4 block.
         # `minlength=NUM_BIOMES` pins the histogram to the palette rather than to whichever ids
@@ -210,9 +220,10 @@ class McImagineDataset(Dataset):
             "seed": torch.tensor(int(params["seed"]), dtype=torch.int64),
             "capability_tier": "none",
             "heightmap": torch.from_numpy(height_core.copy()).to(torch.float32),
+            "occupancy_band": torch.from_numpy(band_transposed.copy()).to(torch.float32),
             "profile_id": torch.from_numpy(profile_core.copy().astype(np.int64)),
             "water_level": torch.tensor(water_level, dtype=torch.float32),
-            "block_volume": torch.zeros(0),  # see class docstring — derived at export time, not trained
+            "block_volume": torch.zeros(0),  # see class docstring — full volume is emitted at export time
             "biome_grid": torch.from_numpy(biome_quarter.copy()),
             "structure_markers": torch.zeros(0),
             "structure_graph_nodes": torch.zeros(0),

@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -113,7 +114,11 @@ public class ModelLoader {
                 ModelInfo info = new ModelInfo(id, name, version, author, description, absPath, onnxFilename,
                         formatVersion, capabilities, true);
 
+                // Logged after the trial inference, not before: a model that announces "0.6.0 -
+                // volumetric" and is then marked unavailable two lines later reads as a working
+                // volumetric model to anyone skimming, which is the confusion this line exists to prevent.
                 boolean available = validateAndTrialInference(mcimPath, info, declaredInputs, declaredOutputs);
+                logFormatContract(id, formatVersion, available);
                 return info.withAvailable(available);
             }
         } catch (Exception e) {
@@ -122,6 +127,96 @@ public class ModelLoader {
 
         return new ModelInfo(defaultName, defaultName, "1.0.0", "Unknown", "A Minecraft Imagine model.",
                 absPath, "model.onnx", "0.1.0", ModelCapabilities.legacyDefaults(), false);
+    }
+
+    /**
+     * Which docs/model-spec.md output contract a manifest's {@code format_version} binds its model to.
+     *
+     * <p>0.6.0 is a purely semantic revision: the tensor names, shapes and dtypes are identical to
+     * 0.5.0's, and what changes is only what the numbers in them promise. Under
+     * {@link #HEIGHTFIELD_0_5_0}, {@code block_volume} is derivable from
+     * {@code (heightmap, profile, water_level)} and {@code heightmap} is the quantity the volume was
+     * expanded from. Under {@link #VOLUMETRIC_0_6_0}, {@code block_volume} is authored directly and
+     * {@code heightmap} is a *report* of its topmost solid cell (docs/phase4-plan.md §1.4, §6).
+     *
+     * <p><b>The mod does not branch on this.</b> It reads {@code block_volume} literally either way,
+     * which is exactly why a 0.5.0 model keeps working unchanged - a heightfield volume is a valid
+     * volume. The classification exists so the distinction is visible in a log: a 0.5.0 model and a
+     * 0.6.0 model produce visibly different worlds, and when a 0.6.0 world comes out looking flat,
+     * this line plus {@link VolumeFallbackLog}'s are what separate "the operator loaded the old
+     * model" from "the new model's volume was rejected".
+     */
+    public enum FormatContract {
+        /** 0.1.0 through 0.5.0: heightmap-derived volume. */
+        HEIGHTFIELD_0_5_0("heightfield: block_volume is derived from heightmap, no overhangs possible"),
+        /** 0.6.0: model-authored volume, heightmap reports its topmost solid cell. */
+        VOLUMETRIC_0_6_0("volumetric: block_volume is authored directly and may contain overhangs"),
+        /** Not a published revision - a corrupt manifest, or one written by a newer toolchain. */
+        UNKNOWN("unrecognized - the mod will read block_volume literally, as it does for every version");
+
+        private final String description;
+
+        FormatContract(String description) {
+            this.description = description;
+        }
+
+        public String description() {
+            return description;
+        }
+    }
+
+    /**
+     * The {@code format_version} values this loader recognizes, mapped to the contract each carries.
+     *
+     * <p>docs/model-spec.md's Versioning section documents 0.6.0, 0.5.0 and (as the revision 0.5.0 kept
+     * compatible with) 0.4.0. The rest are here for archives that predate it: 0.1.0 is this loader's own
+     * default and the dummy test fixture's declared version, and 0.2.0/0.3.0 appear in no document at
+     * all - they are listed only so an archive from that era classifies as heightfield rather than as
+     * {@link FormatContract#UNKNOWN}, since every version before 0.6.0 shares one output contract.
+     *
+     * <p>Exact-string matching, not semver ordering, and that is a deliberate choice rather than an
+     * omission. The mod has never compared versions - {@code format_version} was parsed into
+     * {@link ModelInfo} and otherwise unused - and the one place that does adapt to an older manifest
+     * shape ({@link #getChunkIoNames}) does it by probing for the field it needs rather than by
+     * checking a version number. An enumerated set keeps that property: it is only ever asked "which
+     * of the published revisions is this", a question with no ordering in it, and an unpublished value
+     * is reported as {@link FormatContract#UNKNOWN} rather than being silently sorted into a range it
+     * was never tested against. If a future revision does need "0.6.0 or later" semantics, that is the
+     * point to introduce a comparator - and the point at which one can be tested against a real case.
+     */
+    private static final Map<String, FormatContract> PUBLISHED_FORMAT_VERSIONS = Map.of(
+            "0.1.0", FormatContract.HEIGHTFIELD_0_5_0,
+            "0.2.0", FormatContract.HEIGHTFIELD_0_5_0,
+            "0.3.0", FormatContract.HEIGHTFIELD_0_5_0,
+            "0.4.0", FormatContract.HEIGHTFIELD_0_5_0,
+            "0.5.0", FormatContract.HEIGHTFIELD_0_5_0,
+            "0.6.0", FormatContract.VOLUMETRIC_0_6_0);
+
+    /** Classifies a manifest's {@code format_version}. Never throws; an unusable value is {@code UNKNOWN}. */
+    public static FormatContract formatContract(String formatVersion) {
+        if (formatVersion == null) {
+            return FormatContract.UNKNOWN;
+        }
+        return PUBLISHED_FORMAT_VERSIONS.getOrDefault(formatVersion, FormatContract.UNKNOWN);
+    }
+
+    /**
+     * Records, once per manifest parse, which spec contract the model claims. An unrecognized version
+     * is a warning and not a load failure: every field this loader reads is defaulted, so the archive
+     * still loads and still generates - the operator just needs to know the mod has no idea what it
+     * agreed to.
+     */
+    private void logFormatContract(String id, String formatVersion, boolean available) {
+        FormatContract contract = formatContract(formatVersion);
+        String availability = available ? "" : " - but it failed its load-time checks and is unavailable";
+        if (contract == FormatContract.UNKNOWN) {
+            McImagine.LOGGER.warn("ModelLoader: model '{}' declares format_version '{}', which is not a recognized " +
+                    "docs/model-spec.md revision ({}); loading it anyway{}",
+                    id, formatVersion, contract.description(), availability);
+        } else {
+            McImagine.LOGGER.info("ModelLoader: model '{}' declares format_version {} - {}{}",
+                    id, formatVersion, contract.description(), availability);
+        }
     }
 
     /**
@@ -183,7 +278,7 @@ public class ModelLoader {
             return false;
         }
 
-        try (ModelSession trialSession = new ModelSession(modelBytes)) {
+        try (ModelSession trialSession = new ModelSession(modelBytes, formatContract(info.formatVersion()))) {
             if (!trialSession.isLoaded()) {
                 McImagine.LOGGER.warn("ModelLoader: model '{}' produced an empty ONNX session - marking unavailable", info.id());
                 return false;

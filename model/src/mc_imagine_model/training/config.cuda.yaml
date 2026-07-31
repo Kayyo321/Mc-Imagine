@@ -12,14 +12,15 @@
 #     --config model/src/mc_imagine_model/training/config.cuda.yaml
 #
 # Interrupted? Resume without losing the run:
-#   ... --config .../config.cuda.yaml --resume model/training_runs/cuda_run1/last.pt
+#   ... --config .../config.cuda.yaml --resume model/training_runs/cuda_run3/last.pt
 
 model:
   checkpoint_dir: null  # null -> PromptEncoder uses its own absolute default (model/checkpoints/all-MiniLM-L6-v2), independent of cwd
-  halo: 6
+  halo: 9
   patch: 16
   conv_channels: 192
   num_conv_layers: 6
+  num_conv3d_layers: 3
   fusion_hidden: 512
   fusion_out: 256
   seed_freqs: 32
@@ -42,6 +43,11 @@ training:
   # (see losses.ReliefLoss). Measured at this weight: relief holds ~21% of target across training
   # instead of peaking at 19% by step 750 and collapsing to 6%.
   relief_weight: 10.0
+  # Phase 4 Gate 2 starting point. Sweep these before the full run; do not leave them at zero or
+  # the occupancy head trains only through incidental export-time plumbing.
+  occupancy_weight: 1.0
+  overhang_weight: 1.0
+  consistency_weight: 0.25
   checkpoint_dir: "training_runs/cuda_run3"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
   log_every: 50

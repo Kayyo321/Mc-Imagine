@@ -56,6 +56,24 @@ On an NVIDIA box, install the CUDA-matched torch wheel as well; see
 - `model/` - Python training pipeline (`model/src/mc_imagine_model/`: data, model, training, export) for producing `.mcim` models
 - `docs/` - Technical documentation
 
+## Versioning
+
+The mod (`mod_version` in `mod/gradle.properties`) and the model (the `v1.x.x` releases referenced
+throughout `docs/`) are versioned **independently** — they are different artifacts released on
+different schedules, and pinning them to the same number would just mean one of them lies most of
+the time. What actually has to agree is narrower: the `.mcim` manifest's `format_version` field,
+which `ModelLoader` checks explicitly (`ModelLoader.FormatContract`) and which is documented in
+`docs/model-spec.md`'s Versioning section.
+
+As of Phase 4 (`mod_version 0.2.0-alpha`), the mod understands two format contracts: `0.5.0`
+(heightfield-only `block_volume`, still loadable and correct) and `0.6.0` (volumetric — overhangs,
+the redefined `heightmap`, `capabilities.caves`). A `.mcim` built by an older model-training
+checkout may still declare `0.5.0`, and the mod keeps working with it; a `.mcim` declaring an
+unrecognized future format version is logged and loaded on a best-effort basis rather than rejected.
+**Compatibility is a manifest field the mod reads, not an assumption you get by matching version
+numbers** — check `format_version`, not `mod_version` vs. the model's `v1.x.x` tag, when wiring up a
+new model build against a given mod build.
+
 ## Roadmap
 - **Phase 0**: Architecture planning and foundation.
 - **Phase 1**: Pipeline creation and minimal model training.

@@ -36,26 +36,27 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from mc_imagine_model.model.heads import BiomeHead, TerrainHead
+from mc_imagine_model.model.heads import BiomeHead, Occupancy3DHead, TerrainHead
 from mc_imagine_model.model.positional import CoordinateEncoder, SeedEncoder
 from mc_imagine_model.model.text_encoder import PromptEncoder
 from mc_imagine_model.spec_constants import NUM_BIOMES, NUM_PROFILES
 
-HALO = 6
+HALO = 9
 PATCH = 16
 CONV_CHANNELS = 192
 FUSION_HIDDEN = 512
 FUSION_OUT = 256
 SEED_FREQS = 32
 SEED_EMBED_DIM = 64
-NUM_CONV_LAYERS = 6  # 28x28 -> 16x16 via 6 valid 3x3 convs (each shrinks by 2)
+NUM_CONV_LAYERS = 6  # 34x34 -> 22x22 via 6 valid 3x3 convs (each shrinks by 2)
+NUM_CONV3D_LAYERS = 0  # 2D conv stack shrinks halo to patch
 
 # Each valid (padding=0) 3x3 conv removes exactly one cell from every side, i.e. 2 from each spatial
 # dimension. The halo therefore has to be *exactly* consumed by the stack.
 CONV_SHRINK_PER_LAYER = 2
 
 
-def _check_conv_arithmetic(halo: int, patch: int, num_conv_layers: int) -> None:
+def _check_conv_arithmetic(halo: int, patch: int, num_conv_layers: int, num_conv3d_layers: int = 0) -> None:
     """Fails loudly if halo/layer count don't line up, instead of silently emitting the wrong size.
 
     This is the check that makes `halo`, `patch` and `num_conv_layers` safe to tune from a config
@@ -65,13 +66,13 @@ def _check_conv_arithmetic(halo: int, patch: int, num_conv_layers: int) -> None:
     determined by the depth of the valid-padded stack.
     """
     size = patch + 2 * halo
-    out = size - CONV_SHRINK_PER_LAYER * num_conv_layers
+    out = size - CONV_SHRINK_PER_LAYER * (num_conv_layers + num_conv3d_layers)
     if out != patch:
         raise ValueError(
             f"Conv stack arithmetic mismatch: halo={halo}, patch={patch}, "
-            f"num_conv_layers={num_conv_layers} -> input {size}x{size} shrinks to {out}x{out}, "
-            f"but the chunk output must be exactly {patch}x{patch}. Required: "
-            f"halo == num_conv_layers (each valid 3x3 conv consumes one ring of halo)."
+            f"num_conv_layers={num_conv_layers}, num_conv3d_layers={num_conv3d_layers} -> "
+            f"input {size}x{size} shrinks to {out}x{out}, but the chunk output must be exactly {patch}x{patch}. "
+            f"Required: halo == num_conv_layers + num_conv3d_layers."
         )
 
 
@@ -99,9 +100,11 @@ class ImagineNet(nn.Module):
         halo = config.get("halo", HALO)
         patch = config.get("patch", PATCH)
         num_conv_layers = config.get("num_conv_layers", NUM_CONV_LAYERS)
+        default_conv3d = max(0, halo - num_conv_layers)
+        num_conv3d_layers = config.get("num_conv3d_layers", default_conv3d)
         # Checked before anything is allocated, so a bad config fails at construction with a clear
         # message rather than at the first forward (or, worse, not at all).
-        _check_conv_arithmetic(halo, patch, num_conv_layers)
+        _check_conv_arithmetic(halo, patch, num_conv_layers, num_conv3d_layers)
         if patch != PATCH:
             raise ValueError(
                 f"patch must be {PATCH}: docs/model-spec.md pins model.onnx's heightmap at "
@@ -140,6 +143,7 @@ class ImagineNet(nn.Module):
 
         self.terrain_head = TerrainHead(in_channels=conv_channels, num_profiles=config.get("num_profiles", NUM_PROFILES))
         self.biome_head = BiomeHead(in_channels=conv_channels, num_biomes=config.get("num_biomes", NUM_BIOMES))
+        self.occupancy_head = Occupancy3DHead(in_channels=conv_channels)
         # structure_head / structure_graph_head intentionally never instantiated:
         # structure_support == "none" for this PoC's only trained model.
 
@@ -172,9 +176,10 @@ class ImagineNet(nn.Module):
 
         Returns:
             dict: heightmap [B,16,16], profile_logits [B,num_profiles,16,16], water_level [B,16,16],
-                biome_logits [B,num_biomes,4,4] — the tensors this tier actually trains — plus
-                zeroed placeholders for block_volume/biome_grid/structure_* fields, kept only for
-                interface parity with the full (all-tier) dict shape other code may expect.
+                biome_logits [B,num_biomes,4,4], occupancy_logits [B,64,16,16] — the tensors this
+                tier actually trains — plus zeroed placeholders for block_volume/biome_grid/
+                structure_* fields, kept only for interface parity with the full (all-tier) dict
+                shape other code may expect.
         """
         prompt_emb = self.text_encoder(prompt_tokens)  # [B, 384]
         seed_emb = self.seed_encoder(seed)  # [B, 64]
@@ -189,16 +194,22 @@ class ImagineNet(nn.Module):
         fused_grid = fused.view(b, -1, 1, 1).expand(b, fused.shape[-1], h, w)
 
         x = torch.cat([coord_feats, fused_grid], dim=1)
-        feats = self.conv_stack(x)  # [B, conv_channels, 16, 16]
+        feats = self.conv_stack(x)  # [B, conv_channels, 22, 22]
 
-        heightmap, profile_logits, water_level = self.terrain_head(feats)
-        biome_logits = self.biome_head(feats)
+        # Center crop 16x16 for 2D heads (TerrainHead, BiomeHead)
+        crop_2d = (feats.shape[-1] - 16) // 2
+        feats_2d = feats[:, :, crop_2d:-crop_2d, crop_2d:-crop_2d] if crop_2d > 0 else feats  # [B, conv_channels, 16, 16]
+
+        heightmap, profile_logits, water_level = self.terrain_head(feats_2d)
+        biome_logits = self.biome_head(feats_2d)
+        occupancy_logits = self.occupancy_head(feats)  # [B, 64, 16, 16]
 
         return {
             "heightmap": heightmap,
             "profile_logits": profile_logits,
             "water_level": water_level,
             "biome_logits": biome_logits,
+            "occupancy_logits": occupancy_logits,
             "block_volume": torch.zeros(0),
             "biome_grid": torch.zeros(0),
             "structure_markers": torch.zeros(0),
@@ -206,3 +217,4 @@ class ImagineNet(nn.Module):
             "structure_graph_edges": torch.zeros(0),
             "structure_origin": torch.zeros(0),
         }
+

@@ -1,6 +1,6 @@
 # Mc-Imagine Model Format Specification (.mcim)
 
-**Version:** 0.5.0 (Draft)
+**Version:** 0.6.0
 
 ## Overview
 The `.mcim` file format is the standard distributable format for Mc-Imagine world generation models. An
@@ -180,7 +180,7 @@ model.mcim
 ## `manifest.json` Schema
 The manifest provides the mod with essential information about how to load and use the model.
 
-- **`format_version`**: (String) Version of the .mcim spec (e.g., "0.4.0").
+- **`format_version`**: (String) Version of the .mcim spec (e.g., "0.6.0").
 - **`model`**:
   - `id`: (String) Stable machine identifier (e.g. `"imaginator-high_intensity-intricate_structures"`).
   - `name`: (String) Display name of the model.
@@ -192,7 +192,7 @@ The manifest provides the mod with essential information about how to load and u
   - `intensity`: (String) `"low"`, `"medium"`, or `"high"` — attention to detail in generated output. See "Capability Tiers" above.
   - `terrain`: (Boolean) True if the model predicts terrain heightmap/volume.
   - `biomes`: (Boolean) True if the model predicts biomes.
-  - `caves`: (Boolean) True if the model generates cave systems.
+  - `caves`: (Boolean) True if the model itself authors voids in `block_volume` — overhangs, arches, undercuts, cave mouths — as opposed to emitting a heightfield volume. Meaningful from 0.6.0; every model through 0.5.0 declared `false`. **Read it as "the model chose these voids", not "this world has caves":** vanilla's carvers run after generation and cut caves and ravines through whatever solid mass the model wrote regardless of this flag, which is a deliberate design win and predates the flag being usable. A `false` model still yields a world with caves in it; a `true` model yields one whose surface geometry is not a function of a heightmap.
   - `structure_support`: (String) `"none"`, `"basic"`, or `"intricate"` — see "Capability Tiers" above. Supersedes the old boolean `structures` field; a manifest with `structure_support` omitted is treated as `"none"`.
   - `prompt_tags`: (List of Strings) Semantic tags the model can act on (e.g. `"terrain"`, `"biome_blend"`, `"structures"`, `"loot"`, `"redstone"`). The world-creation UI tags the player's prompt with the same vocabulary and warns/strips any clause whose tag isn't in this list rather than failing outright.
   - `block_palette`: (List of Strings) Namespaced IDs of blocks the model can output, indexed by `block_volume`'s integer ids (index `0` is always air).
@@ -250,9 +250,30 @@ A transposed axis order is the most likely silent failure in the whole pipeline 
 sides (training export, mod loader) must conform to this exactly, not to whatever felt natural locally.
 
 **All tiers:**
-- `heightmap`: `int32[16, 16]` - Surface elevation for the chunk. `[z][x]`.
-- `block_volume`: `int32[16, 384, 16]` - 3D grid of block state IDs mapped to `capabilities.block_palette`. `[x][y][z]`.
+- `heightmap`: `int32[16, 16]` - **The topmost solid cell of `block_volume` for that column** (redefined in 0.6.0 — see below). `[z][x]`.
+- `block_volume`: `int32[16, 384, 16]` - 3D grid of block state IDs mapped to `capabilities.block_palette`. `[x][y][z]`. **Not derivable from the other outputs** (see below).
 - `biome_grid`: `int32[4, 96, 4]` - Biome distribution per 4x4x4 volume, mapped to `capabilities.biome_palette`. `[x][y][z]` at quarter resolution.
+
+**`block_volume` is authoritative, and is no longer derivable (0.6.0).** Through 0.5.0 every shipped model
+expanded `block_volume` from `(heightmap, profile, water_level)` with a fixed rule — `y <= h` is solid, one
+transition per column, in the graph, by construction. Three separate docstrings in the training pipeline
+assumed that derivability. It no longer holds: a 0.6.0 model predicts per-cell occupancy directly, so a
+column may contain **any number of alternating solid and air runs**. Consumers must read `block_volume`
+cell-by-cell and must not reconstruct it from `heightmap`. This is what makes overhangs, natural arches,
+undercut cliffs and walk-in cave mouths representable at all; under the old rule they were not merely
+unimplemented but *unexpressible*.
+
+**`heightmap` means "topmost solid", not "the height the model predicted" (0.6.0).** The two coincided
+before and do not now: a model that internally predicts an anchor height and then carves material away
+above it would disagree with itself. The mod uses `heightmap` for `getBaseHeight`, for priming
+`WORLD_SURFACE_WG`/`OCEAN_FLOOR_WG`, and hence for vanilla decoration and structure placement — so if the
+two definitions drift, decoration floats in the air and structures bury themselves. Exporters **must emit
+`heightmap` by reading back the volume they just produced**, not by rounding an internal prediction, which
+makes the guarantee true by construction. Where a column somehow contains no solid cell at all, emit the
+model's own anchor height as the floor rather than an arbitrary sentinel.
+
+Note what does *not* change: both tensors keep their shape, their dtype and their pinned axis order. This is
+a **semantic** break, which is exactly the kind that passes every shape check and fails in the world.
 
 **`structure_support: "basic"` only:**
 - `structure_markers`: `float32[N, 5]` - List of potential single-piece structures (type_id, x, y, z, probability). Each marker stamps one hand-authored NBT template (a ruin, a shrine) at the given position — no internal composition.
@@ -313,6 +334,20 @@ runtime (no crash, just silently wrong embeddings) and is validated by a golden-
 Breaking changes to the manifest schema or expected tensor shapes will result in a minor version bump (e.g., 0.3.0 to 0.4.0). The mod will warn players if they attempt to load an incompatible format version.
 
 ## Versioning
+- **0.6.0**: `block_volume` is no longer derivable from `(heightmap, profile, water_level)` — a model
+  predicts per-cell occupancy and a column may hold any number of solid/air runs; `heightmap` is redefined
+  as the topmost solid cell of `block_volume` (both in "Output Tensors" above); `capabilities.caves`
+  becomes meaningful. No tensor shape, dtype or axis order changes.
+  **0.5.0 manifests remain loadable and 0.5.0 models remain correct.** A heightfield volume is a valid
+  volume — one solid run per column is a legal special case of "any number of runs" — so a 0.5.0 model's
+  output is bit-for-bit unchanged under a 0.6.0 loader, and nothing in the mod branches on
+  `format_version` to produce terrain. The redefinition of `heightmap` is likewise compatible in that
+  direction: for a heightfield volume the topmost solid cell *is* the predicted height, so 0.5.0 models
+  already satisfied the 0.6.0 definition; only models that carve above their own anchor could have
+  distinguished the two, and none existed before 0.6.0.
+  Following the precedent 0.5.0 set for 0.4.0, the version is recorded and logged so an operator can tell
+  which contract a loaded model honours — which matters here precisely because a 0.6.0 model that fails
+  and falls back to heightfield terrain looks exactly like a working 0.5.0 model.
 - **0.5.0**: Pinned axis order for `heightmap`/`block_volume`/`biome_grid` (previously ambiguous — see
   "Output Tensors" above); added optional `capabilities.biome_palette`; documented the tokenizer scheme
   (BERT-family WordPiece) authoritatively rather than leaving it to "standard HuggingFace format" alone.
@@ -333,13 +368,15 @@ on the terrain being intentionally conservative (small heightmap deltas) rather 
 machinery — acceptable at this tier because the prompts it targets don't ask for coordinated large-scale
 landforms or spatial style zones the way the high-intensity example below does.
 
+The manifest below illustrates the v1.1.2 / 0.6.0 configuration with `format_version: "0.6.0"` and `caves: true`.
+
 ```json
 {
-  "format_version": "0.5.0",
+  "format_version": "0.6.0",
   "model": {
     "id": "imaginator-low_intensity-no_structures",
     "name": "Imaginator - Low Intensity",
-    "version": "1.0.0",
+    "version": "1.1.2",
     "author": "Mc-Imagine Team",
     "description": "Conservative terrain shaping from natural-landscape prompts. No structure generation.",
     "license": "CC-BY-4.0"
@@ -348,7 +385,7 @@ landforms or spatial style zones the way the high-intensity example below does.
     "intensity": "low",
     "terrain": true,
     "biomes": true,
-    "caves": false,
+    "caves": true,
     "structure_support": "none",
     "prompt_tags": ["terrain", "biome_blend"],
     "block_palette": ["minecraft:stone", "minecraft:dirt", "minecraft:grass_block", "minecraft:water", "minecraft:sand"],

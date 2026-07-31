@@ -1,14 +1,20 @@
 """
 Packaging script that bundles ONNX graph(s), tokenizer, and manifest into a .mcim ZIP file.
 
-Manifest shape follows docs/model-spec.md (format_version 0.5.0) — keep this in sync with that
+Manifest shape follows docs/model-spec.md (format_version 0.6.0) — keep this in sync with that
 document, not the other way around. As of 0.4.0 a model may ship up to three ONNX graphs:
 model.onnx (per-chunk, always required), macro.onnx (per-macro-region, required iff
 capabilities.requires_macro_field), and detail.onnx (per-detail-pass, optional even when
-capabilities.detail_passes > 0). 0.5.0 adds `capabilities.biome_palette` and pins the axis order
+capabilities.detail_passes > 0). 0.5.0 added `capabilities.biome_palette` and pinned the axis order
 documented in "Output Tensors" (this script doesn't encode axis order itself — that's a property of
 what export_onnx.py actually produces — but the manifest's capabilities block is what the mod uses
-to interpret the ids inside those tensors).
+to interpret the ids inside those tensors). 0.6.0 (Phase 4, docs/phase4-plan.md §6) makes
+`capabilities.caves` meaningful for the first time and is a *semantic* break even though this
+script's manifest shape is unchanged: `heightmap` is now the topmost solid cell of `block_volume`
+rather than a value `block_volume` is derived from, and `block_volume` is no longer derivable from
+`(heightmap, profile, water_level)` — both are properties of what export_onnx.py emits, not of this
+packaging step, but the manifest this script writes is what tells the mod to trust that volume
+literally.
 """
 
 import argparse
@@ -20,7 +26,7 @@ from typing import Any, Dict, List
 from mc_imagine_model.spec_constants import BIOME_PALETTE, BLOCK_PALETTE
 
 
-FORMAT_VERSION = "0.5.0"
+FORMAT_VERSION = "0.6.0"
 
 
 def _chunk_output_names(structure_support: str) -> List[str]:
@@ -76,7 +82,7 @@ def _palette_arg(value: Any, default: List[str]) -> List[str]:
 
 
 def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
-    """Builds a manifest.json dict conforming to docs/model-spec.md (format_version 0.5.0)."""
+    """Builds a manifest.json dict conforming to docs/model-spec.md (format_version 0.6.0)."""
     capabilities: Dict[str, Any] = {
         "intensity": args.intensity,
         "terrain": True,
@@ -186,7 +192,7 @@ def main() -> None:
 
     parser.add_argument("--model_id", type=str, required=True, help="e.g. imaginator-low_intensity-no_structures")
     parser.add_argument("--name", type=str, required=True)
-    parser.add_argument("--version", type=str, default="1.0.0")
+    parser.add_argument("--version", type=str, required=True, help="Model version (e.g. 1.0.0)")
     parser.add_argument("--author", type=str, default="Unknown")
     parser.add_argument("--description", type=str, default="A Minecraft Imagine model.")
     parser.add_argument("--license", type=str, default="CC-BY-4.0")

@@ -4,6 +4,7 @@ import com.mcimagine.api.ModelInfo;
 import com.mcimagine.model.ChunkOutput;
 import com.mcimagine.model.FallbackTerrain;
 import com.mcimagine.model.ModelSession;
+import com.mcimagine.model.VolumeFallbackLog;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
@@ -314,5 +315,204 @@ public class ImagineChunkGeneratorTest {
 
         assertEquals(Blocks.WATER.defaultBlockState(), column.getBlock(50),
                 "a heightmap-derived fallback volume must still be flooded up to sea level");
+    }
+
+    // --- The silent downgrade to heightfield terrain (docs/phase4-plan.md §5.1, §8) -------------------
+    // Rejecting a model's block_volume produces terrain that looks like a working previous release, so
+    // the log line is the only evidence it happened. These pin that it is emitted for a model-authored
+    // volume and *not* for the no-model path, which is a different finding with its own log line.
+
+    @Test
+    public void aRejectedModelVolumeIsRecordedAsADowngrade() throws Exception {
+        VolumeFallbackLog.reset();
+        int[] heightmap = new int[256];
+        Arrays.fill(heightmap, 40);
+
+        ImagineChunkGenerator wrongLength = generatorReturning(
+                new ChunkOutput(heightmap, new int[7], new int[4 * 96 * 4], new float[0][0]));
+        wrongLength.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+        assertEquals(1, VolumeFallbackLog.occurrences(VolumeFallbackLog.Cause.VOLUME_WRONG_LENGTH));
+
+        ImagineChunkGenerator nullVolume = generatorReturning(
+                new ChunkOutput(heightmap, null, new int[4 * 96 * 4], new float[0][0]));
+        nullVolume.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+        assertEquals(1, VolumeFallbackLog.occurrences(VolumeFallbackLog.Cause.VOLUME_NULL),
+                "a null block_volume is the same downgrade as a wrong-length one and was previously logged nowhere");
+    }
+
+    @Test
+    public void aFallbackAuthoredVolumeIsNotReportedAsAModelDowngrade() throws Exception {
+        // The discrimination itself, exercised on the only input that reaches the branch: a volume that
+        // is BOTH malformed and flagged fallback-authored. A healthy no-model chunk cannot test this -
+        // FallbackTerrain always returns a full-length volume, so validateBlockVolume's length check is
+        // never entered and an assertion made there would hold no matter what the branch body did.
+        VolumeFallbackLog.reset();
+        int[] heightmap = new int[256];
+        Arrays.fill(heightmap, 40);
+        ChunkOutput malformedFallback =
+                new ChunkOutput(heightmap, new int[7], new int[4 * 96 * 4], new float[0][0], true);
+
+        ImagineChunkGenerator generator = generatorReturning(malformedFallback);
+        NoiseColumn column = generator.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+
+        for (VolumeFallbackLog.Cause cause : VolumeFallbackLog.Cause.values()) {
+            assertEquals(0, VolumeFallbackLog.occurrences(cause),
+                    "no model authored this volume; reporting it as a discarded model volume would make the "
+                            + "two findings indistinguishable (" + cause + ")");
+        }
+        assertEquals(Blocks.WATER.defaultBlockState(), column.getBlock(50),
+                "sanity: the rebuilt volume is still flooded to sea level, so the branch really was taken");
+    }
+
+    @Test
+    public void theHealthyNoModelPathLogsNothing() {
+        // Weaker than the test above by construction, and kept only for what it does prove: a normal
+        // fallback-engine chunk never reaches the rejection branch in the first place.
+        VolumeFallbackLog.reset();
+
+        ImagineChunkGenerator generator = new ImagineChunkGenerator(plainsBiomeSource, overworldSettings, new ModelSession());
+        generator.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+
+        for (VolumeFallbackLog.Cause cause : VolumeFallbackLog.Cause.values()) {
+            assertEquals(0, VolumeFallbackLog.occurrences(cause), cause.toString());
+        }
+    }
+
+    private static final int OVERHANG_LOCAL_X = 8;
+    private static final int OVERHANG_LOCAL_Z = 8;
+
+    /**
+     * A model-shaped {@code block_volume} for column (localX=8, localZ=8) with two solid runs and an
+     * air gap between them (an overhang), shared by {@link #testMultipleSolidRunsAndTopmostHeightReturn}
+     * and {@link #testFillFromNoiseRoundTripsMultipleSolidRunsWithGapIntact} so both halves of
+     * docs/phase4-plan.md §5.3's "must round-trip through both fillFromNoise and getBaseColumn"
+     * requirement are pinned against the exact same fixture.
+     *
+     * <p>Lower solid run: y = -64..20 (solid). Air gap (cave cavity): y = 21..35 (air). Upper solid
+     * run: y = 36..60 (solid) - topmost solid height 60. Air above: y = 61..319 (air).
+     */
+    private static ChunkOutput twoSolidRunsWithGapOutput() {
+        int minY = -64;
+        int heightSpan = 384;
+        int[] blockVolume = new int[16 * heightSpan * 16];
+        int[] heightmap = new int[256];
+
+        int localX = OVERHANG_LOCAL_X;
+        int localZ = OVERHANG_LOCAL_Z;
+
+        // Set topmost solid height for (localX=8, localZ=8) to 60
+        heightmap[localZ * 16 + localX] = 60;
+
+        for (int y = -64; y <= 20; y++) {
+            int idx = (localX * heightSpan + (y - minY)) * 16 + localZ;
+            blockVolume[idx] = 1; // solid
+        }
+        for (int y = 21; y <= 35; y++) {
+            int idx = (localX * heightSpan + (y - minY)) * 16 + localZ;
+            blockVolume[idx] = 0; // air
+        }
+        for (int y = 36; y <= 60; y++) {
+            int idx = (localX * heightSpan + (y - minY)) * 16 + localZ;
+            blockVolume[idx] = 1; // solid
+        }
+
+        return new ChunkOutput(heightmap, blockVolume, new int[4 * 96 * 4], new float[0][0]);
+    }
+
+    @Test
+    public void testMultipleSolidRunsAndTopmostHeightReturn() throws Exception {
+        ChunkOutput output = twoSolidRunsWithGapOutput();
+        ImagineChunkGenerator generator = generatorReturning(output);
+
+        // Verify getBaseHeight returns topmost solid height
+        int returnedHeight = generator.getBaseHeight(8, 8, Heightmap.Types.OCEAN_FLOOR_WG, FULL_HEIGHT_LEVEL, null);
+        assertEquals(60, returnedHeight, "getBaseHeight must return topmost solid cell height 60");
+
+        // Verify getBaseColumn resolves multiple solid runs and air gaps
+        NoiseColumn column = generator.getBaseColumn(8, 8, FULL_HEIGHT_LEVEL, null);
+        assertNotEquals(Blocks.AIR.defaultBlockState(), column.getBlock(60), "Topmost solid cell must be solid");
+        assertNotEquals(Blocks.AIR.defaultBlockState(), column.getBlock(45), "Upper solid run core must be solid");
+        assertEquals(Blocks.AIR.defaultBlockState(), column.getBlock(25), "Cave cavity between solid runs must be air");
+        assertNotEquals(Blocks.AIR.defaultBlockState(), column.getBlock(10), "Lower solid run must be solid");
+    }
+
+    /**
+     * docs/phase4-plan.md §5.3: the same two-solid-run-with-gap column must round-trip through
+     * {@code fillFromNoise} too, not just {@code getBaseColumn}/{@code getBaseHeight}
+     * ({@link #testMultipleSolidRunsAndTopmostHeightReturn}) - {@code fillFromNoise} is the code path
+     * that actually writes the chunk sections players stand in, and a §1.4-style "heightmap drifted
+     * from the volume" regression on the mod's side would only show up here, e.g. if a future change
+     * naively filled everything between {@code minBuildHeight} and the heightmap's topmost height
+     * instead of trusting {@code block_volume} literally.
+     */
+    @Test
+    public void testFillFromNoiseRoundTripsMultipleSolidRunsWithGapIntact() throws Exception {
+        ChunkOutput output = twoSolidRunsWithGapOutput();
+        ImagineChunkGenerator generator = generatorReturning(output);
+
+        // fillFromNoise writes through LevelChunkSection.acquire()/setBlockState()/release() (see
+        // testFillFromNoiseWithModelInference above), so the mock chunk needs the same section +
+        // heightmap-unprimed stubbing.
+        int minBuildHeight = -64;
+        int maxBuildHeight = 320;
+        int sectionCount = (maxBuildHeight - minBuildHeight) / 16;
+
+        Map<Integer, BlockState[][][]> sectionWrites = new HashMap<>();
+        LevelChunkSection[] sections = new LevelChunkSection[sectionCount];
+        for (int i = 0; i < sectionCount; i++) {
+            LevelChunkSection section = Mockito.mock(LevelChunkSection.class);
+            BlockState[][][] local = new BlockState[16][16][16];
+            Mockito.when(section.setBlockState(Mockito.anyInt(), Mockito.anyInt(), Mockito.anyInt(), any(BlockState.class), anyBoolean()))
+                    .thenAnswer(invocation -> {
+                        int lx = invocation.getArgument(0);
+                        int ly = invocation.getArgument(1);
+                        int lz = invocation.getArgument(2);
+                        BlockState state = invocation.getArgument(3);
+                        local[lx][ly][lz] = state;
+                        return state;
+                    });
+            sectionWrites.put(i, local);
+            sections[i] = section;
+        }
+
+        ChunkAccess mockChunk = Mockito.mock(ChunkAccess.class);
+        Mockito.when(mockChunk.getPos()).thenReturn(new ChunkPos(0, 0));
+        Mockito.when(mockChunk.getMinBuildHeight()).thenReturn(minBuildHeight);
+        Mockito.when(mockChunk.getMaxBuildHeight()).thenReturn(maxBuildHeight);
+        Mockito.when(mockChunk.getSections()).thenReturn(sections);
+        Mockito.when(mockChunk.getSectionIndex(Mockito.anyInt()))
+                .thenAnswer(invocation -> ((int) invocation.getArgument(0) - minBuildHeight) >> 4);
+        Mockito.when(mockChunk.getOrCreateHeightmapUnprimed(Heightmap.Types.WORLD_SURFACE_WG))
+                .thenReturn(Mockito.mock(Heightmap.class));
+        Mockito.when(mockChunk.getOrCreateHeightmapUnprimed(Heightmap.Types.OCEAN_FLOOR_WG))
+                .thenReturn(Mockito.mock(Heightmap.class));
+
+        Executor directExecutor = Runnable::run;
+        ChunkAccess result = generator.fillFromNoise(directExecutor, Blender.empty(), null, null, mockChunk).join();
+        assertNotNull(result, "Resulting chunk should not be null");
+
+        // Both solid runs must have placed real blocks...
+        assertNotEquals(Blocks.AIR.defaultBlockState(),
+                writtenBlockAt(sectionWrites, minBuildHeight, OVERHANG_LOCAL_X, OVERHANG_LOCAL_Z, 10),
+                "Lower solid run (y=10) must place a real block via fillFromNoise");
+        assertNotEquals(Blocks.AIR.defaultBlockState(),
+                writtenBlockAt(sectionWrites, minBuildHeight, OVERHANG_LOCAL_X, OVERHANG_LOCAL_Z, 45),
+                "Upper solid run core (y=45) must place a real block via fillFromNoise");
+        assertNotEquals(Blocks.AIR.defaultBlockState(),
+                writtenBlockAt(sectionWrites, minBuildHeight, OVERHANG_LOCAL_X, OVERHANG_LOCAL_Z, 60),
+                "Topmost solid cell (y=60) must place a real block via fillFromNoise");
+
+        // ...and the air gap between them (the overhang) must not have been filled in.
+        assertEquals(Blocks.AIR.defaultBlockState(),
+                writtenBlockAt(sectionWrites, minBuildHeight, OVERHANG_LOCAL_X, OVERHANG_LOCAL_Z, 25),
+                "Air gap between the two solid runs (y=25) must remain air through fillFromNoise - filling it "
+                        + "in would be the §1.4 heightmap-vs-volume drift regression this test exists to catch");
+    }
+
+    private static BlockState writtenBlockAt(Map<Integer, BlockState[][][]> sectionWrites, int minBuildHeight,
+                                              int localX, int localZ, int y) {
+        int sectionIndex = (y - minBuildHeight) >> 4;
+        int localY = (y - minBuildHeight) & 15;
+        return sectionWrites.get(sectionIndex)[localX][localY][localZ];
     }
 }

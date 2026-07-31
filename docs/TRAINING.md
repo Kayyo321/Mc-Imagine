@@ -69,7 +69,7 @@ python -m mc_imagine_model.training.train \
 Use `config.mps.yaml` on Apple Silicon, or edit `device:` to `cpu`. Useful flags:
 
 - `--max-steps 50` — smoke test; proves the whole pipeline runs before you commit hours to it.
-- `--resume model/training_runs/cuda_run1/last.pt` — continue an interrupted run (restores model,
+- `--resume model/training_runs/cuda_run3/last.pt` — continue an interrupted run (restores model,
   optimizer, LR schedule, epoch and step).
 
 **What you should see immediately.** Before the first optimizer step the run prints a target-range
@@ -94,7 +94,7 @@ number. (Don't be alarmed when none appears after epoch 0 on CUDA; the first lan
 
 ```bash
 python -m mc_imagine_model.scripts.build_mcim \
-    --checkpoint model/training_runs/cuda_run1/best.pt \
+    --checkpoint model/training_runs/cuda_run3/best.pt \
     --out imaginator-low_intensity-no_structures-1.1.0.mcim
 ```
 
@@ -134,13 +134,14 @@ Good prompts to sanity-check with, and what each should look like:
 Day 1 shipped a model with these measured properties. Any retrain should beat them; if it doesn't,
 something regressed:
 
-| Metric | Day-1 baseline | Why it was bad |
-|---|---|---|
-| Height std, `snow-capped peaks` | **0.03** (pinned at 158.84–158.98) | tanh saturated at its 159 ceiling — dead gradient, zero relief |
-| Height std, all 6 prompts | 0.02 – 3.73 | Terrain was essentially flat everywhere |
-| Deepest terrain generated | y = **27.7** | No valleys of any consequence, nothing near sea level's underside |
-| Trainable params | ~800 k | Under-capacity |
-| Inference latency | 8.9 ms/chunk | Fine — ~10× under the 100 ms budget, so there is headroom to grow |
+| Metric | Day-1 baseline | Phase 3 / v1.1.0 baseline | Why it was bad |
+|---|---|---|---|
+| Height std, `snow-capped peaks` | **0.03** (pinned at 158.84–158.98) | ~18.5 (active relief) | tanh saturated at its 159 ceiling — dead gradient, zero relief |
+| Height std, all 6 prompts | 0.02 – 3.73 | Variable per prompt | Terrain was essentially flat everywhere |
+| Relief retention metric | ~6% (collapsed) | **~21% of target** (stable) | Without ReliefLoss, relief collapsed by step 750 |
+| Deepest terrain generated | y = **27.7** | y = 5.6 | No valleys of any consequence, nothing near sea level's underside |
+| Trainable params | ~800 k | ~2.57 M | Under-capacity |
+| Inference latency | 8.9 ms/chunk | 8.9 ms/chunk | Fine — ~10× under the 100 ms budget, so there is headroom to grow |
 
 The Phase-2 changes (see `docs/phase2-plan.md`) address each: a canonical, *learnable* noise field
 instead of per-region pseudorandom fields; a head range of [-96, 288] instead of [-33, 159]; real

@@ -116,6 +116,55 @@ HEIGHT_MAX = HEIGHT_CENTER + HEIGHT_AMPLITUDE  # 288
 TERRAIN_CLIP_MIN = -48.0
 TERRAIN_CLIP_MAX = 252.0
 
+# --- the surface-anchored occupancy band (Phase 4 — docs/phase4-plan.md §1.2) --------------------
+# Everything before v1.1.2 derived `block_volume` from one predicted height per column via
+# `y <= h -> solid` (export/export_onnx.py). That is a total order on each column: exactly one
+# air/solid transition, by construction, in the graph, forever — so overhangs, arches, undercut
+# cliffs and walk-in cave mouths were not unimplemented but *unrepresentable*. v1.1.2 replaces that
+# comparison with a per-cell occupancy band, and these constants are its geometry.
+#
+# The band is ANCHORED TO THE PREDICTED HEIGHT, not to absolute world y. An absolute band would have
+# to span the whole 384-block world height to work at every elevation, which is the 98,304-cell
+# problem the band exists to avoid; anchoring means the head only ever models "the interesting 64
+# blocks", wherever they are, and spends no capacity learning that y=-30 is usually stone.
+#
+#   band index i in [0, BAND_HEIGHT)  <->  world y = round(h) + BAND_BOTTOM_OFFSET + i
+#
+# i.e. index 0 is the BOTTOM of the band and index BAND_HEIGHT-1 is its top, so band index runs the
+# same direction as world y. Below the band: solid rock, deterministically, exactly as before (and
+# vanilla's carvers still cut deep caves down there, as they always have). Above it: air, or water
+# per docs/phase4-plan.md §1.5's openness rule.
+#
+# WHY 64. It has to cover the tallest natural void a player can walk into plus the full horizontal
+# reach of an undercut, and it is the term that sets the occupancy head's output size. 64 is the
+# starting value; docs/phase4-plan.md §7's Gate 0 measures the ground truth's cavity-height
+# distribution and either confirms it or grows the band. DO NOT tune this after training starts —
+# it changes the tensor shape of every band array, every shard, and the head itself.
+#
+# WHY +2 AT THE TOP. The surface cell itself is `h`, and the band needs headroom above it so a
+# column can legitimately place solid material above the anchor (the lip of an overhang seen from
+# the column beneath it) rather than having the representation clip it away.
+BAND_HEIGHT = 64
+BAND_BOTTOM_OFFSET = -61  # world y of band index 0, relative to the column's predicted height
+BAND_TOP_OFFSET = 2       # world y of band index BAND_HEIGHT-1, relative to the same height
+assert BAND_TOP_OFFSET - BAND_BOTTOM_OFFSET + 1 == BAND_HEIGHT, (
+    "band offsets and BAND_HEIGHT must describe the same 64 cells: an off-by-one here silently "
+    "misaligns the generator's target band against the head's output band, which trains fine and "
+    "produces terrain shifted vertically by one block against its own heightmap"
+)
+
+# THE BAND CAN HANG OFF THE BOTTOM OF THE WORLD, AND THAT IS EXPECTED. Terrain is generated down to
+# TERRAIN_CLIP_MIN (-48), so a column anchored there puts its band bottom at -48 - 61 = -109, below
+# Minecraft's floor at y=-64. The band is a *relative* window and is deliberately NOT clamped to fit
+# the world: clamping the anchor `h` upward so the whole band fits (h >= -3) would forbid every deep
+# canyon floor the Phase 2 work exists to produce, and clamping the band's *extent* per column would
+# make its cell count position-dependent, which the fixed [64,16,16] tensor shape cannot express.
+# Instead, consumers must drop band cells whose world y falls outside [MIN_Y, MAX_Y]:
+#   - export/export_onnx.py writes band cells into the volume only where the world y is in range;
+#   - data/world_generator.py renders the band as solid wherever it hangs below the world floor,
+#     so the target and the emitted volume agree about those cells being unreachable rock.
+# The top is safe by construction: BAND_TOP_OFFSET is 2 and export already clamps `h` to MAX_Y - 2.
+
 # --- loss normalization scales (Phase 2 follow-up — MEASURED, not guessed) -----------------------
 # These are deliberately NOT `HEIGHT_AMPLITUDE`. Normalizing a loss term by the head's full output
 # range is principled-sounding and quantitatively disastrous, because it scales each term by how

@@ -15,11 +15,12 @@ requires *inside* the traced graph:
   - runs the frozen MiniLM encoder on prompt_tokens (attention mask derived from tokens != 0,
     inside PromptEncoder.forward);
   - builds the global-coordinate halo grid from chunk_x/chunk_z (inside CoordinateEncoder.forward);
-  - runs the decoder (heightmap, profile logits, water level, biome logits);
-  - expands those ~350 predicted scalars into the full `block_volume: int32[16,384,16]` using
-    torch.where-style ops over a broadcast y-grid, and `biome_grid: int32[4,96,4]` by broadcasting
-    the quarter-resolution biome prediction across all 96 y-quarter-levels (this model doesn't
-    predict biome variation with depth — an explicit, documented simplification, not a bug).
+  - runs the decoder (heightmap, profile logits, water level, biome logits, occupancy logits);
+  - expands the 64-cell surface-anchored occupancy band into the full
+    `block_volume: int32[16,384,16]` using torch.where-style ops over a broadcast y-grid, and
+    `biome_grid: int32[4,96,4]` by broadcasting the quarter-resolution biome prediction across all
+    96 y-quarter-levels (this model doesn't predict biome variation with depth — an explicit,
+    documented simplification, not a bug).
 
 So the mod never has to replicate any of this in Java: `model.onnx` takes exactly the 4 spec'd
 inputs and emits exactly the 3 spec'd outputs, fully spec-conformant.
@@ -38,6 +39,9 @@ import torch.nn as nn
 from mc_imagine_model.model.imagine_net import ImagineNet
 from mc_imagine_model.spec_constants import (
     AIR_ID,
+    BAND_BOTTOM_OFFSET,
+    BAND_HEIGHT,
+    BAND_TOP_OFFSET,
     BEDROCK_ID,
     DEEPSLATE_ID,
     HEIGHT_MAX,
@@ -80,9 +84,10 @@ class ChunkExportWrapper(nn.Module):
     per docs/model-spec.md's `model.onnx` contract. See module docstring for the expansion logic.
     """
 
-    def __init__(self, imagine_net: ImagineNet) -> None:
+    def __init__(self, imagine_net: ImagineNet, deterministic_carve: bool = False) -> None:
         super().__init__()
         self.imagine_net = imagine_net
+        self.deterministic_carve = deterministic_carve
 
         subsurface_ids = [row[1] for row in PROFILE_TABLE]
         surface_ids = [row[2] for row in PROFILE_TABLE]
@@ -100,6 +105,7 @@ class ChunkExportWrapper(nn.Module):
         profile_logits = out["profile_logits"]  # [B, num_profiles, 16, 16] = [B, P, z, x]
         water_f = out["water_level"]           # [B,16,16] = [B, z, x]
         biome_logits = out["biome_logits"]     # [B, num_biomes, 4, 4] = [B, C, z_q, x_q]
+        occupancy_logits = out["occupancy_logits"]  # [B,64,16,16] = [B, band_i, z, x]
 
         # TerrainHead's band ([HEIGHT_MIN, HEIGHT_MAX]) intentionally extends below the world floor,
         # so this clamp is load-bearing, not defensive: it is what keeps every index into the
@@ -117,9 +123,7 @@ class ChunkExportWrapper(nn.Module):
         profile_zx = profile_id[0]
         biome_zx = biome_id[0]   # [4,4] z_q,x_q
 
-        heightmap_out = h_zx.to(torch.int32)  # spec: int32[16,16], indexed [z][x] — already matches.
-
-        # transpose [z,x] -> [x,z] for block_volume, which is indexed [x][y][z]
+        # transpose [z,x] -> [x,z] for 3D tensors, which are indexed [x][y][z]
         h_xz = h_zx.transpose(0, 1)          # [16(x), 16(z)]
         water_xz = water_zx.transpose(0, 1)
         profile_xz = profile_zx.transpose(0, 1)
@@ -134,16 +138,60 @@ class ChunkExportWrapper(nn.Module):
         subsurface_b = subsurface_xz.unsqueeze(1).expand(shape)
         surface_b = surface_xz.unsqueeze(1).expand(shape)
 
+        band_bottom_b = h_b + BAND_BOTTOM_OFFSET
+        band_top_b = h_b + BAND_TOP_OFFSET
+
+        # Base solid mask. In normal Phase 4 exports the model-authored occupancy band is
+        # authoritative inside the 64-block window; below it is deterministic rock, and above it is
+        # air/water. The gather maps each absolute world-y cell back to the column's relative band
+        # index, whose index 0 is the bottom of the band (spec_constants.BAND_BOTTOM_OFFSET).
+        occupancy_xiz = occupancy_logits[0].permute(2, 0, 1)  # [16(x),64(i),16(z)]
+        band_i = (y_b - band_bottom_b).clamp(0, BAND_HEIGHT - 1).to(torch.int64)
+        band_solid = torch.gather(occupancy_xiz, 1, band_i) >= 0.0
+        in_band = (y_b >= band_bottom_b) & (y_b <= band_top_b)
+        below_band = y_b < band_bottom_b
+        is_solid = below_band | (in_band & band_solid)
+
+        if self.deterministic_carve:
+            # Gate 1 fixture mode: prove the ONNX/mod plumbing with a guaranteed overhang before a
+            # trained occupancy head exists. Release exports leave this disabled and use the
+            # predicted occupancy band above.
+            is_solid = (y_b <= h_b)
+            x_grid = torch.arange(CHUNK_SIZE, device=y_b.device).view(CHUNK_SIZE, 1, 1).expand(shape)
+            z_grid = torch.arange(CHUNK_SIZE, device=y_b.device).view(1, 1, CHUNK_SIZE).expand(shape)
+            carve_mask = (x_grid >= 3) & (x_grid <= 12) & (z_grid >= 3) & (z_grid <= 12) & (y_b >= h_b - 20) & (y_b <= h_b - 6)
+            is_solid = is_solid & (~carve_mask)
+
+        # Derive heightmap tensor from topmost solid cell y in each (x, z) column
+        y_solid_vals = torch.where(is_solid, y_b, torch.tensor(MIN_Y - 1, dtype=torch.int64, device=y_b.device))
+        topmost_solid_y, _ = torch.max(y_solid_vals, dim=1)  # [16(x), 16(z)] via ReduceMax
+        has_solid, _ = torch.max(is_solid.to(torch.int64), dim=1)
+        topmost_solid_y = torch.where(has_solid > 0, topmost_solid_y, h_xz)
+        topmost_solid_y = torch.clamp(topmost_solid_y, MIN_Y, MAX_Y)
+
+        heightmap_out = topmost_solid_y.transpose(0, 1).to(torch.int32)  # [16(z), 16(x)]
+
+        topmost_y_b = topmost_solid_y.unsqueeze(1).expand(shape)
+
+        # Open-to-sky water fill via top-down cumsum on flipped solid mask
+        solid_flipped = torch.flip(is_solid.to(torch.int64), dims=[1])
+        cum_solid_top_down_flipped = torch.cumsum(solid_flipped, dim=1)
+        cum_solid_top_down = torch.flip(cum_solid_top_down_flipped, dims=[1])
+        open_to_sky = (cum_solid_top_down == 0)
+
+        is_water = (~is_solid) & (y_b <= water_b) & open_to_sky
+
+        # Topmost solid run surface dressing
         rock_b = torch.where(
-            y_b < 0, torch.full(shape, DEEPSLATE_ID, dtype=torch.int64), torch.full(shape, STONE_ID, dtype=torch.int64)
+            y_b < 0, torch.full(shape, DEEPSLATE_ID, dtype=torch.int64, device=y_b.device), torch.full(shape, STONE_ID, dtype=torch.int64, device=y_b.device)
         )
 
-        block = torch.full(shape, AIR_ID, dtype=torch.int64)
-        block = torch.where(y_b <= h_b, rock_b, block)
-        block = torch.where((y_b >= h_b - 4) & (y_b <= h_b - 1), subsurface_b, block)
-        block = torch.where(y_b == h_b, surface_b, block)
-        block = torch.where((y_b > h_b) & (y_b <= water_b), torch.full(shape, WATER_ID, dtype=torch.int64), block)
-        block = torch.where(y_b == MIN_Y, torch.full(shape, BEDROCK_ID, dtype=torch.int64), block)
+        block = torch.full(shape, AIR_ID, dtype=torch.int64, device=y_b.device)
+        block = torch.where(is_solid, rock_b, block)
+        block = torch.where(is_solid & (y_b >= topmost_y_b - 4) & (y_b <= topmost_y_b - 1), subsurface_b, block)
+        block = torch.where(is_solid & (y_b == topmost_y_b), surface_b, block)
+        block = torch.where(is_water, torch.full(shape, WATER_ID, dtype=torch.int64, device=y_b.device), block)
+        block = torch.where(y_b == MIN_Y, torch.full(shape, BEDROCK_ID, dtype=torch.int64, device=y_b.device), block)
 
         block_volume_out = block.to(torch.int32)  # [16(x), 384(y), 16(z)] — matches spec directly.
 
@@ -157,14 +205,14 @@ def load_imagine_net(checkpoint_path: str) -> ImagineNet:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]["model"]
     net = ImagineNet(config)
-    net.load_state_dict(ckpt["model_state_dict"])
+    net.load_state_dict(ckpt["model_state_dict"], strict=False)
     net.eval()
     return net
 
 
-def export_chunk_graph(checkpoint_path: str, output_path: str, opset: int) -> None:
+def export_chunk_graph(checkpoint_path: str, output_path: str, opset: int, deterministic_carve: bool = False) -> None:
     net = load_imagine_net(checkpoint_path)
-    wrapper = ChunkExportWrapper(net)
+    wrapper = ChunkExportWrapper(net, deterministic_carve=deterministic_carve)
     wrapper.eval()
 
     dummy_prompt = torch.zeros((1, 128), dtype=torch.int32)
@@ -225,8 +273,8 @@ def verify_coordinate_purity(net: ImagineNet, seed: int = 12345) -> float:
     16-block tiles, so no *exported* chunk output ever exposes two chunks' values for the *same*
     global coordinate to compare directly. What must instead be proven is that the network's
     seam-avoidance mechanism itself (CoordinateEncoder purity + the valid-padding-only conv stack
-    being a fixed deterministic function) is bit-exact — which is what this function checks, and
-    what `export_onnx.py`'s per-chunk cropping in `ChunkExportWrapper` relies on.
+    combining valid 2D convs and valid 3D convs in x/z being a fixed deterministic function) is bit-exact —
+    which is what this function checks, and what `export_onnx.py`'s per-chunk cropping in `ChunkExportWrapper` relies on.
 
     Returns the max abs difference (expected to be exactly 0.0, or at most float rounding noise).
     """
@@ -319,12 +367,14 @@ def main() -> None:
     parser.add_argument("--output", type=str, default="model.onnx", help="Output ONNX file path")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--skip-verify", action="store_true", help="Skip the ORT round-trip verification")
+    parser.add_argument("--deterministic-carve", action="store_true",
+                        help="Gate 1 fixture mode: ignore occupancy_logits and carve a fixed test overhang")
     args = parser.parse_args()
 
     print(f"Exporting checkpoint {args.checkpoint} ({args.graph} graph) to {args.output} with opset {args.opset}")
 
     if args.graph == "chunk":
-        export_chunk_graph(args.checkpoint, args.output, args.opset)
+        export_chunk_graph(args.checkpoint, args.output, args.opset, deterministic_carve=args.deterministic_carve)
         if not args.skip_verify:
             verify_chunk_graph(args.output, args.checkpoint)
     elif args.graph == "macro":

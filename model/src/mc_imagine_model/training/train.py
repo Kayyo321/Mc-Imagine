@@ -361,6 +361,9 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
         biome_weight=train_cfg.get("biome_weight", 1.0),
         slope_weight=train_cfg.get("slope_weight", 1.0),
         relief_weight=train_cfg.get("relief_weight", 0.0),
+        occupancy_weight=train_cfg.get("occupancy_weight", 0.0),
+        overhang_weight=train_cfg.get("overhang_weight", 0.0),
+        consistency_weight=train_cfg.get("consistency_weight", 0.0),
         structure_weight=0.0,
         structure_graph_weight=0.0,
     )
@@ -406,7 +409,7 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
             with autocast_ctx:
                 preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
                 targets = build_targets(batch)
-                loss = criterion(preds, targets)
+                loss, loss_dict = criterion(preds, targets)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -424,8 +427,13 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
             if step % train_cfg.get("log_every", 50) == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 logger.info(
-                    "epoch %d step %d/%d loss=%.4f lr=%.6g", epoch, step, steps_per_epoch,
-                    loss.item(), lr,
+                    "epoch %d step %d/%d loss=%.4f (terrain=%.4f, biome=%.4f, relief=%.4f) lr=%.6g",
+                    epoch, step, steps_per_epoch,
+                    loss.item(),
+                    loss_dict["terrain"].item(),
+                    loss_dict["biome"].item(),
+                    loss_dict["relief"].item(),
+                    lr,
                 )
 
             if max_steps is not None and global_step >= max_steps:
@@ -440,6 +448,9 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
         if (epoch + 1) % train_cfg.get("val_every_epochs", 1) == 0:
             model.eval()
             val_loss_total = 0.0
+            val_t_total = 0.0
+            val_b_total = 0.0
+            val_r_total = 0.0
             val_count = 0
             with torch.no_grad():
                 for batch in val_loader:
@@ -451,11 +462,20 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
                     with autocast_ctx:
                         preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
                         targets = build_targets(batch)
-                        loss = criterion(preds, targets)
+                        loss, loss_dict = criterion(preds, targets)
                     val_loss_total += loss.item()
+                    val_t_total += loss_dict["terrain"].item()
+                    val_b_total += loss_dict["biome"].item()
+                    val_r_total += loss_dict["relief"].item()
                     val_count += 1
             val_loss = val_loss_total / max(1, val_count)
-            logger.info("=== epoch %d val_loss=%.4f ===", epoch, val_loss)
+            val_t = val_t_total / max(1, val_count)
+            val_b = val_b_total / max(1, val_count)
+            val_r = val_r_total / max(1, val_count)
+            logger.info(
+                "=== epoch %d val_loss=%.4f (terrain=%.4f, biome=%.4f, relief=%.4f) ===",
+                epoch, val_loss, val_t, val_b, val_r,
+            )
 
             ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
             save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, config,
@@ -494,11 +514,28 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=None, help="Stop after N steps (smoke test)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Checkpoint to resume from (model+optimizer+scheduler+epoch/step)")
+    parser.add_argument("--relief-weight", type=float, default=None,
+                        help="Override relief_weight specified in config")
+    parser.add_argument("--occupancy-weight", type=float, default=None,
+                        help="Override occupancy_weight specified in config")
+    parser.add_argument("--overhang-weight", type=float, default=None,
+                        help="Override overhang_weight specified in config")
+    parser.add_argument("--consistency-weight", type=float, default=None,
+                        help="Override consistency_weight specified in config")
     args = parser.parse_args()
 
     print(f"Starting training with config: {args.config}")
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    if args.relief_weight is not None:
+        config["training"]["relief_weight"] = args.relief_weight
+    if args.occupancy_weight is not None:
+        config["training"]["occupancy_weight"] = args.occupancy_weight
+    if args.overhang_weight is not None:
+        config["training"]["overhang_weight"] = args.overhang_weight
+    if args.consistency_weight is not None:
+        config["training"]["consistency_weight"] = args.consistency_weight
 
     train(config, max_steps=args.max_steps, resume=args.resume)
 

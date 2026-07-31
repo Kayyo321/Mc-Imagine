@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Bridge between the mod and ONNX Runtime. Wraps an ONNX Runtime inference session for a single
@@ -27,12 +28,36 @@ public class ModelSession implements AutoCloseable {
     private OrtEnvironment env;
     private OrtSession session;
     private boolean isClosed = false;
+    /**
+     * Latches the heightmap-only-graph notice in {@link #generateChunk} - once per session instance,
+     * not per process, so a second world or a second dimension loading the same model repeats it.
+     * {@code generateChunk} runs on many threads, hence the atomic.
+     */
+    private final AtomicBoolean loggedHeightmapOnlyGraph = new AtomicBoolean(false);
+
+    /**
+     * The output contract this model's manifest claims (docs/model-spec.md {@code format_version}),
+     * or {@link ModelLoader.FormatContract#UNKNOWN} when the session was built from raw bytes with no
+     * manifest in reach.
+     *
+     * <p>Nothing about tensor decoding or block placement reads this - it selects the severity of one
+     * diagnostic, and only for the case where the graph emits no {@code block_volume} at all. That
+     * case is an expected legacy configuration under every pre-0.6.0 contract and a broken export
+     * under 0.6.0, and there is no way to tell those apart from the tensors alone.
+     */
+    private final ModelLoader.FormatContract declaredContract;
 
     public ModelSession() {
         // Default constructor - no model loaded, generateChunk falls back to FallbackTerrain.
+        this.declaredContract = ModelLoader.FormatContract.UNKNOWN;
     }
 
     public ModelSession(byte[] modelBytes) throws OrtException {
+        this(modelBytes, ModelLoader.FormatContract.UNKNOWN);
+    }
+
+    public ModelSession(byte[] modelBytes, ModelLoader.FormatContract declaredContract) throws OrtException {
+        this.declaredContract = declaredContract != null ? declaredContract : ModelLoader.FormatContract.UNKNOWN;
         if (modelBytes != null && modelBytes.length > 0) {
             this.env = OrtEnvironment.getEnvironment();
             this.session = env.createSession(modelBytes, new OrtSession.SessionOptions());
@@ -40,14 +65,19 @@ public class ModelSession implements AutoCloseable {
     }
 
     public ModelSession(Path mcimPath) throws Exception {
+        this(mcimPath, ModelLoader.FormatContract.UNKNOWN);
+    }
+
+    public ModelSession(Path mcimPath, ModelLoader.FormatContract declaredContract) throws Exception {
         ModelLoader loader = new ModelLoader(mcimPath.getParent());
         byte[] modelBytes = loader.extractModelBytes(mcimPath);
+        this.declaredContract = declaredContract != null ? declaredContract : ModelLoader.FormatContract.UNKNOWN;
         this.env = OrtEnvironment.getEnvironment();
         this.session = env.createSession(modelBytes, new OrtSession.SessionOptions());
     }
 
     public ModelSession(ModelInfo modelInfo) throws Exception {
-        this(Path.of(modelInfo.path()));
+        this(Path.of(modelInfo.path()), ModelLoader.formatContract(modelInfo.formatVersion()));
     }
 
     public boolean isLoaded() {
@@ -100,6 +130,7 @@ public class ModelSession implements AutoCloseable {
                 int[] blockVolume = new int[0];
                 int[] biomeGrid = new int[0];
                 float[][] structureMarkers = new float[0][0];
+                boolean graphEmittedVolume = false;
 
                 // Bug #1 fix: dispatch strictly by exact tensor name (docs/model-spec.md's pinned output
                 // names), never "the first output of any name" — with a 3-output model that previously
@@ -112,7 +143,10 @@ public class ModelSession implements AutoCloseable {
                     }
                     switch (name) {
                         case "heightmap" -> heightmap = padOrTruncate(extractTensorAsInts(tensor, name), 256, heightmap);
-                        case "block_volume" -> blockVolume = extractTensorAsInts(tensor, name);
+                        case "block_volume" -> {
+                            graphEmittedVolume = true;
+                            blockVolume = extractTensorAsInts(tensor, name);
+                        }
                         case "biome_grid" -> biomeGrid = extractTensorAsInts(tensor, name);
                         default -> {
                             // Unknown/unsupported output for this tier (e.g. structure_* tensors on a
@@ -124,8 +158,37 @@ public class ModelSession implements AutoCloseable {
                 // A legacy/heightmap-only graph gets a Java-synthesized volume, which fills only up to
                 // the surface - the consumer has to flood it below sea level itself, so flag it as
                 // fallback-derived (see ChunkOutput#blockVolumeFromFallback).
+                //
+                // This is the second place a volume can silently become heightfield-derived
+                // (docs/phase4-plan.md §5.1 names only ImagineChunkGenerator#validateBlockVolume), and the
+                // three situations it covers do not all deserve the same treatment:
+                //
+                //  - the graph emitted block_volume and it decoded to nothing: a volumetric model whose
+                //    terrain is being thrown away. The §5.1 downgrade, reported loudly.
+                //  - the graph emitted no block_volume at all, from a model declaring the 0.6.0 volumetric
+                //    contract: the export dropped the output the whole contract is about, and the volume
+                //    is *not* recoverable from the heightmap. Also the §5.1 downgrade, and the one this
+                //    release newly makes possible - a dropped output in export/packaging looks identical
+                //    in-world to a legacy model, which is why it is not allowed to log as one.
+                //  - the graph emitted no block_volume, from a model declaring an older contract: a legacy
+                //    heightmap-only model, e.g. the dummy test fixture, whose manifest declares exactly one
+                //    output. Under a pre-0.6.0 contract block_volume *is* derivable from the heightmap
+                //    (docs/model-spec.md), so the synthesis reproduces what the model meant. Expected, so
+                //    it is noted once per session rather than reported per chunk.
                 boolean volumeFromFallback = false;
                 if (blockVolume.length == 0 && heightmap.length > 0) {
+                    int expectedLength = 16 * FallbackTerrain.HEIGHT_SPAN * 16;
+                    if (graphEmittedVolume) {
+                        VolumeFallbackLog.heightfieldDowngrade(VolumeFallbackLog.Cause.VOLUME_EMPTY,
+                                chunkX, chunkZ, 0, expectedLength);
+                    } else if (declaredContract == ModelLoader.FormatContract.VOLUMETRIC_0_6_0) {
+                        VolumeFallbackLog.heightfieldDowngrade(VolumeFallbackLog.Cause.VOLUME_OUTPUT_MISSING,
+                                chunkX, chunkZ, -1, expectedLength);
+                    } else if (loggedHeightmapOnlyGraph.compareAndSet(false, true)) {
+                        McImagine.LOGGER.info("ModelSession: this graph emits no block_volume output and its " +
+                                "manifest declares {}, so one is being synthesized from its heightmap for every " +
+                                "chunk. This world cannot contain model-authored overhangs.", declaredContract);
+                    }
                     blockVolume = FallbackTerrain.buildBlockVolumeFromHeightmap(heightmap);
                     volumeFromFallback = true;
                 }

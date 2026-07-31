@@ -45,7 +45,7 @@ public final class ModelRegistry {
                 return Optional.empty();
             }
             byte[] bytes = loader.extractModelBytes(match);
-            ModelSession session = new ModelSession(bytes);
+            ModelSession session = new ModelSession(bytes, ModelLoader.formatContract(match.formatVersion()));
             SESSIONS.put(modelId, session);
             INFOS.put(modelId, match);
             return Optional.of(session);

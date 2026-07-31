@@ -50,11 +50,13 @@ def main() -> int:
                         help="Skip the ONNX Runtime round-trip check (not recommended)")
     parser.add_argument("--keep-onnx", action="store_true",
                         help="Keep the intermediate .onnx instead of deleting it")
+    parser.add_argument("--deterministic-carve", action="store_true",
+                        help="Gate 1 fixture mode: export a fixed hand-carved overhang instead of the trained occupancy head")
 
     meta = parser.add_argument_group("manifest metadata")
     meta.add_argument("--model_id", default=DEFAULT_MODEL_ID)
     meta.add_argument("--name", default="Mc-Imagine Low Intensity")
-    meta.add_argument("--version", default="1.0.0")
+    meta.add_argument("--version", required=True, help="Version string for manifest (e.g. 1.1.0)")
     meta.add_argument("--author", default="Mc-Imagine")
     meta.add_argument("--description", default="Prompt-conditioned terrain and biome generator.")
     meta.add_argument("--license", default="CC-BY-4.0")
@@ -69,6 +71,10 @@ def main() -> int:
     # Imported here (not at module import time) so `--help` works without torch/onnx loaded.
     from mc_imagine_model.export.export_onnx import export_chunk_graph, verify_chunk_graph
     from mc_imagine_model.export.package_mcim import write_mcim
+
+    if args.version != "1.1.2":
+        print(f"ERROR: --version 1.1.2 is required for Phase 4 Gate 1 builds (got '{args.version}')", file=sys.stderr)
+        return 1
 
     if not os.path.isfile(args.checkpoint):
         print(f"ERROR: checkpoint not found: {args.checkpoint}", file=sys.stderr)
@@ -87,7 +93,7 @@ def main() -> int:
 
     t0 = time.time()
     print(f"[1/3] Exporting {args.checkpoint} -> {onnx_path} (opset {args.opset})")
-    export_chunk_graph(args.checkpoint, onnx_path, args.opset)
+    export_chunk_graph(args.checkpoint, onnx_path, args.opset, deterministic_carve=args.deterministic_carve)
 
     if args.skip_verify:
         print("[2/3] Skipping ORT verification (--skip-verify)")
@@ -117,7 +123,7 @@ def main() -> int:
         intensity=args.intensity,
         structure_support=args.structure_support,
         biomes=True,
-        caves=False,  # the chunk graph has no 3D volume head; caves come from vanilla carvers
+        caves=True,  # format version 0.6.0 volumetric chunk generation with 3D caves
         prompt_tags=args.prompt_tags,
         block_palette=None,
         biome_palette=None,
