@@ -38,7 +38,10 @@ training:
   relief_weight: 10.0
   # Phase 4 Gate 2 starting point; sweep before a full release run.
   occupancy_weight: 1.0
-  overhang_weight: 1.0
+  # Overhang loss weight. Lowered from 1.0 to 0.005 per Phase 4.1 recovery plan.
+  # High overhang weights (e.g. 1.0 or 0.05) caused severe loss instability and gradient clipping
+  # domination at Gate 2 (overhang loss spiked to ~243.0 at step 0). Empirical optimal range is [0.003, 0.01].
+  overhang_weight: 0.005
   consistency_weight: 0.25
   checkpoint_dir: "training_runs/rehearsal"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this

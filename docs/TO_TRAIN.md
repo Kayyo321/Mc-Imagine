@@ -83,8 +83,12 @@ value. In game I specifically want to check:
 KNOWN OPEN ISSUES — don't chase these as if they're new bugs
 - Terrain repeats every 2048 blocks. Deliberate trade for learnability; documented.
 - Canyon floors are narrow (deep but ~30 blocks wide). One-constant fix if I dislike it.
-- The model cannot make overhangs or caves — block volume is expanded from one height per
-  column. Caves come from vanilla carvers.
+- Overhangs/caves (Phase 4, docs/phase4-plan.md) are mid-flight, not shipped: the
+  architecture, ground truth, and ONNX plumbing are built and verified, but the occupancy
+  head has not yet demonstrated it can learn multi-run (walkable-void) columns at
+  rehearsal scale — see "Phase 4.1 confirmatory long run" below before assuming this
+  works. Until that lands, block volume is still expanded from one height per column;
+  caves come from vanilla carvers.
 
 HOW I WANT YOU TO WORK
 - Verify each step actually worked instead of assuming — this project has already been
@@ -114,6 +118,68 @@ saturated activation that silently flattened all terrain, and a block-palette of
 that rendered stone as bedrock and red sand as water — both produced output that looked
 plausible and raised no errors. Neither was caught by reading code; both were caught by
 measuring. See `docs/phase2-plan.md` §0.
+
+## Phase 4.1 confirmatory long run (overhangs / caves)
+
+If you're picking this repo up mid-Phase-4 (`docs/phase4-plan.md`, `docs/phase4.1-plan.md`):
+the "KNOWN OPEN ISSUES" note above about "the model cannot make overhangs or caves" is what
+this phase is trying to fix. Gate 2's first sweep (`docs/CHANGELOG.md`) failed uniformly —
+0.0000% multi-run columns on all 14 checkpoints — traced to `overhang_weight: 1.0` being an
+unnormalized loss term ~50-250x the magnitude of every other loss, destabilizing the
+optimizer. `docs/phase4.1-plan.md` §1.2 corrected the shipped configs to `overhang_weight:
+0.005` and fixed a `train.py` checkpoint-saving bug (§1.1) that silently wrote zero
+checkpoints under `--max-steps` on a config whose epoch outruns the step count. Before
+spending Gate 3's full 8000-region/9-hour CUDA budget, §2.2 calls for one confirmatory run
+at the corrected weight, long enough to tell "undertrained" from "structurally incapable"
+apart — the original Gate 2 sweep only ran 400 steps, half of them inside warmup.
+
+**Run it like this** (400 regions — this is still rehearsal-scale, no need for the full
+8000-region dataset yet):
+
+```bash
+# 1. Regenerate/confirm the 400-region rehearsal dataset (same one Gate 2's sweep used).
+PYTHONPATH=model/src python3 -m mc_imagine_model.scripts.generate_data \
+  --regions 400 --out model/data --seed 0
+
+# 2. config.rehearsal.yaml ships num_epochs: 1 (~143 steps total over 400 regions at
+#    batch_size 256) — too short to ever reach --max-steps 3000 on its own; the run would
+#    silently stop at ~143 steps via the normal epoch-end path instead of the intended
+#    3000, an "it finished" result that is quietly not the confirmatory run at all. Bump
+#    num_epochs first so there's enough of the dataset to iterate over:
+sed 's/num_epochs: 1/num_epochs: 25/' \
+  model/src/mc_imagine_model/training/config.rehearsal.yaml \
+  > model/src/mc_imagine_model/training/config.confirmatory.yaml
+
+# 3. The confirmatory run itself: 2,000-4,000 steps per §2.2, midpoint 3000, at the
+#    corrected overhang_weight. Passed explicitly on the CLI so it can't silently fall back
+#    to whatever a given config's default happens to be; occupancy_weight/consistency_weight
+#    stay at config defaults pending the §1.2 re-sweep (run_phase4_sweep.sh).
+PYTHONPATH=model/src python3 -m mc_imagine_model.training.train \
+  --config model/src/mc_imagine_model/training/config.confirmatory.yaml \
+  --max-steps 3000 \
+  --overhang-weight 0.005
+
+# 4. Evaluate against the same 400-region ground truth, full 5-condition go/no-go:
+PYTHONPATH=model/src python3 -m mc_imagine_model.scripts.diagnose_overhangs \
+  --ground-truth model/data \
+  --checkpoint model/training_runs/rehearsal/best.pt
+```
+
+**The decision point (§2.2, §3 Step C) — read the `multi_run_column_pct` line, then branch:**
+
+- **Still exactly 0.0000%.** Treat this as a real negative result, not a "needs more steps"
+  excuse to run longer again. Move to `docs/phase4.1-plan.md` §2.3's structural diagnosis in
+  order: (1) is the occupancy head initializing near "always air"/"always solid" rather than
+  the true ~0.38% overhang-cell marginal, (2) is gradient flow through the y-axis
+  `ConvTranspose3d` upsample starved relative to the 2D backbone at matched depth, (3) is
+  `OccupancyLoss`'s transition-cell weighting actually strong enough given how rare
+  transition cells are in the target, (4) only after 1-3 — capacity. Do not start Gate 3
+  while this branch is open.
+- **Multi-run columns appear, even a little.** Proceed to the §1.2 re-sweep
+  (`./run_phase4_sweep.sh`) and re-run the full 5-condition go/no-go
+  (`evaluate_baseline_gate()` in `diagnose_overhangs.py`) properly before considering Gate 3.
+  A PASS there is a genuine go; `docs/phase4-plan.md` §7's Gate 3/Gate 4 text applies
+  unchanged.
 
 ## If you are the person handing this repo over
 

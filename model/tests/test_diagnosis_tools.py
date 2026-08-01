@@ -580,7 +580,9 @@ def test_baseline_gate_speckle_fails_the_conjunction() -> None:
     assert gate["verdict"] == "FAIL"
     assert gate["conditions"] == {"multi_run_margin": True,
                                   "walkable_void_retention": False,
-                                  "p90_cavity_height": False}
+                                  "walkable_mean_floor_retention": False,
+                                  "p90_cavity_height": False,
+                                  "relief_retention": None}
     assert gate["walkable_void_retention"] == 0.0
     assert gate["observed_p50_cavity_height"] == 1
     assert gate["observed_p90_cavity_height"] == 1
@@ -654,7 +656,188 @@ def test_baseline_gate_gate0_is_not_a_gate2_verdict() -> None:
     g = evaluate_baseline_gate(dict(m, multi_run_column_pct=100.0), {"multi_run_column_pct": 0.0}, 5.0)
     assert g["is_gate2_verdict"] is False
     assert g["conditions"]["walkable_void_retention"] is None
-    assert g["verdict"] == "PASS"          # conditions 1 and 3 only
+    assert g["verdict"] == "PASS"          # conditions 1 and 4 only
+
+
+def test_baseline_gate_all_five_conditions_pass_and_fail() -> None:
+    """Verifies pass/fail evaluation across all 5 conditions in evaluate_baseline_gate()."""
+    gt_metrics = {
+        "multi_run_column_pct": 50.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 100, "void_count": 10, "min_height": 3},
+    }
+    obs_metrics = {
+        "multi_run_column_pct": 55.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 100, "void_count": 10, "min_height": 3},
+    }
+    baseline_metrics = {"multi_run_column_pct": 0.0}
+
+    # Pass all 5
+    g_pass = evaluate_baseline_gate(
+        obs_metrics, baseline_metrics, margin_pts=5.0, gt_metrics=gt_metrics,
+        min_void_retention=0.25, min_mean_floor_retention=0.25,
+        observed_relief_retention=0.25, min_relief_retention=0.20
+    )
+    assert g_pass["verdict"] == "PASS"
+    assert g_pass["conditions"] == {
+        "multi_run_margin": True,
+        "walkable_void_retention": True,
+        "walkable_mean_floor_retention": True,
+        "p90_cavity_height": True,
+        "relief_retention": True,
+    }
+
+    # Test Condition 1 failure
+    obs_c1_fail = dict(obs_metrics, multi_run_column_pct=4.0)
+    g_c1 = evaluate_baseline_gate(obs_c1_fail, baseline_metrics, margin_pts=5.0, gt_metrics=gt_metrics, observed_relief_retention=0.25)
+    assert g_c1["conditions"]["multi_run_margin"] is False
+    assert g_c1["verdict"] == "FAIL"
+
+    # Test Condition 2 failure (low void retention)
+    obs_c2_fail = dict(obs_metrics, walkable={"voids_per_1000_columns": 2.0, "floor_cells": 20, "void_count": 2, "min_height": 3})
+    g_c2 = evaluate_baseline_gate(obs_c2_fail, baseline_metrics, margin_pts=5.0, gt_metrics=gt_metrics, min_void_retention=0.25, observed_relief_retention=0.25)
+    assert g_c2["conditions"]["walkable_void_retention"] is False
+    assert g_c2["verdict"] == "FAIL"
+
+    # Test Condition 3 failure (low mean floor area retention)
+    obs_c3_fail = dict(obs_metrics, walkable={"voids_per_1000_columns": 10.0, "floor_cells": 10, "void_count": 10, "min_height": 3})
+    g_c3 = evaluate_baseline_gate(obs_c3_fail, baseline_metrics, margin_pts=5.0, gt_metrics=gt_metrics, min_mean_floor_retention=0.25, observed_relief_retention=0.25)
+    assert g_c3["conditions"]["walkable_void_retention"] is True
+    assert g_c3["conditions"]["walkable_mean_floor_retention"] is False
+    assert g_c3["verdict"] == "FAIL"
+
+    # Test Condition 4 failure (low p90 cavity height)
+    obs_c4_fail = dict(obs_metrics, cavity={"percentiles": {"p50": 1, "p90": 2}})
+    g_c4 = evaluate_baseline_gate(obs_c4_fail, baseline_metrics, margin_pts=5.0, gt_metrics=gt_metrics, observed_relief_retention=0.25)
+    assert g_c4["conditions"]["p90_cavity_height"] is False
+    assert g_c4["verdict"] == "FAIL"
+
+    # Test Condition 5 failure (low relief retention)
+    g_c5 = evaluate_baseline_gate(obs_metrics, baseline_metrics, margin_pts=5.0, gt_metrics=gt_metrics, observed_relief_retention=0.15, min_relief_retention=0.20)
+    assert g_c5["conditions"]["relief_retention"] is False
+    assert g_c5["verdict"] == "FAIL"
+
+
+def test_baseline_gate_zero_void_gt_and_mean_floor_edge_cases() -> None:
+    """Verifies edge cases when ground truth has 0 voids or 0 floor cells."""
+    gt_zero = {
+        "multi_run_column_pct": 50.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 0.0, "floor_cells": 0, "void_count": 0, "min_height": 3},
+    }
+    obs_metrics = {
+        "multi_run_column_pct": 55.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 50, "void_count": 5, "min_height": 3},
+    }
+    baseline_metrics = {"multi_run_column_pct": 0.0}
+
+    g = evaluate_baseline_gate(obs_metrics, baseline_metrics, gt_metrics=gt_zero)
+    assert g["walkable_void_retention"] is None
+    assert g["conditions"]["walkable_void_retention"] is False
+    assert g["walkable_mean_floor_retention"] is None
+    assert g["conditions"]["walkable_mean_floor_retention"] is False
+    assert g["verdict"] == "FAIL"
+
+
+def test_baseline_gate_both_sides_zero_voids_passes_mean_floor_vacuously() -> None:
+    """Condition 3 must not fail when NEITHER side has any walkable void — nothing to retain."""
+    gt_zero = {
+        "multi_run_column_pct": 50.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 0.0, "floor_cells": 0, "void_count": 0, "min_height": 3},
+    }
+    obs_zero = {
+        "multi_run_column_pct": 55.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 0.0, "floor_cells": 0, "void_count": 0, "min_height": 3},
+    }
+    baseline_metrics = {"multi_run_column_pct": 0.0}
+
+    g = evaluate_baseline_gate(obs_zero, baseline_metrics, gt_metrics=gt_zero)
+    assert g["walkable_mean_floor_retention"] is None
+    assert g["conditions"]["walkable_mean_floor_retention"] is True
+    # Condition 2 (void count retention) is a separate, deliberately stricter condition — an
+    # undefined ground truth still means "not met" there, so this fixture still fails overall.
+    assert g["conditions"]["walkable_void_retention"] is False
+    assert g["verdict"] == "FAIL"
+
+
+def test_baseline_gate_shattered_voids_low_mean_floor_retention() -> None:
+    """GT has 1 large cavern; model produces 10 tiny pockets (high void count, low mean floor)."""
+    gt_metrics = {
+        "multi_run_column_pct": 50.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 1.0, "floor_cells": 16, "void_count": 1, "min_height": 3},
+    }
+    # Model retains 10x voids (10 per 1000 cols), but floor_cells = 10 (mean floor = 1.0 vs GT 16.0 -> retention = 0.0625 < 0.25)
+    obs_shattered = {
+        "multi_run_column_pct": 55.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 10, "void_count": 10, "min_height": 3},
+    }
+    baseline_metrics = {"multi_run_column_pct": 0.0}
+
+    g = evaluate_baseline_gate(obs_shattered, baseline_metrics, gt_metrics=gt_metrics)
+    assert g["conditions"]["walkable_void_retention"] is True
+    assert g["conditions"]["walkable_mean_floor_retention"] is False
+    assert g["verdict"] == "FAIL"
+
+
+def test_baseline_gate_relief_retention_optional_handling() -> None:
+    """Verifies relief retention is optional when None and enforced when provided."""
+    gt_metrics = {
+        "multi_run_column_pct": 50.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 100, "void_count": 10, "min_height": 3},
+    }
+    obs_metrics = {
+        "multi_run_column_pct": 55.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 100, "void_count": 10, "min_height": 3},
+    }
+    baseline_metrics = {"multi_run_column_pct": 0.0}
+
+    # When observed_relief_retention is None, relief_retention condition is None and does not block PASS
+    g_none = evaluate_baseline_gate(obs_metrics, baseline_metrics, gt_metrics=gt_metrics, observed_relief_retention=None)
+    assert g_none["conditions"]["relief_retention"] is None
+    assert g_none["verdict"] == "PASS"
+
+    # When observed_relief_retention is provided and >= min_relief_retention, it passes
+    g_pass = evaluate_baseline_gate(obs_metrics, baseline_metrics, gt_metrics=gt_metrics, observed_relief_retention=0.20, min_relief_retention=0.20)
+    assert g_pass["conditions"]["relief_retention"] is True
+    assert g_pass["verdict"] == "PASS"
+
+    # When observed_relief_retention is provided and < min_relief_retention, it fails
+    g_fail = evaluate_baseline_gate(obs_metrics, baseline_metrics, gt_metrics=gt_metrics, observed_relief_retention=0.19, min_relief_retention=0.20)
+    assert g_fail["conditions"]["relief_retention"] is False
+    assert g_fail["verdict"] == "FAIL"
+
+
+def test_baseline_gate_gate0_vs_gate2_modes() -> None:
+    """Verifies Gate 0 (gt_metrics is None) vs Gate 2 (gt_metrics provided) modes."""
+    obs_metrics = {
+        "multi_run_column_pct": 55.0,
+        "cavity": {"percentiles": {"p50": 4, "p90": 4}},
+        "walkable": {"voids_per_1000_columns": 10.0, "floor_cells": 100, "void_count": 10, "min_height": 3},
+    }
+    baseline_metrics = {"multi_run_column_pct": 0.0}
+
+    # Gate 0 mode
+    g0 = evaluate_baseline_gate(obs_metrics, baseline_metrics, gt_metrics=None)
+    assert g0["is_gate2_verdict"] is False
+    assert g0["conditions"]["walkable_void_retention"] is None
+    assert g0["conditions"]["walkable_mean_floor_retention"] is None
+    assert g0["verdict"] == "PASS"
+
+    # Gate 2 mode
+    gt_metrics = dict(obs_metrics)
+    g2 = evaluate_baseline_gate(obs_metrics, baseline_metrics, gt_metrics=gt_metrics)
+    assert g2["is_gate2_verdict"] is True
+    assert g2["conditions"]["walkable_void_retention"] is True
+    assert g2["conditions"]["walkable_mean_floor_retention"] is True
+    assert g2["verdict"] == "PASS"
 
 
 def test_percentiles_from_counts_are_exact_nearest_rank() -> None:
@@ -966,7 +1149,8 @@ def test_print_report_runs_for_gate0_and_gate2(capsys) -> None:
     assert "VERDICT:" in out2
     assert "relief retention" in out2         # §7's fourth condition, measured elsewhere
     assert "1. multi-run columns" in out2 and "2. walkable-void retention" in out2
-    assert "3. p90 cavity height" in out2
+    assert "3. mean floor area retention" in out2 and "4. p90 cavity height" in out2
+    assert "5. relief retention" in out2
 
 
 def test_band_index_run_warns_in_the_report(capsys) -> None:

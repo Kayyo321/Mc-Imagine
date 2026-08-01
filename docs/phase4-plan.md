@@ -660,14 +660,14 @@ retention column is one honest ratio.
 | | 0 | Max cavity height distribution | | — | — | Validates the 64-block band |
 | | 0 | Shard size, 10 regions | | — | — | Extrapolate to 8000 |
 | | 1 | Walk-under screenshot, hand-carved volume | — | — | — | Pass/fail; plumbing only |
-| | 2 | Multi-run columns, rehearsal | | | | Go/no-go condition 1: ≥ baseline + 5.0 pts |
-| | 2 | Walkable-void *count* retention, rehearsal | | | | Go/no-go condition 2: ≥ 25%. **World y, not band index** |
-| | 2 | Walkable-void *mean floor area* retention | | | | Go/no-go condition 3: ≥ 25% — rejects shattering |
-| | 2 | p90 cavity height, rehearsal | | | | Go/no-go condition 4: ≥ 3 blocks — rejects speckle |
-| | 2 | Relief retention (must not regress from v1.1.1) | | | | v1.1.1 baseline: TBD (v1.1.0 was ~21%) |
-| | 2 | Biome accuracy (must not regress) | | | | |
-| | 2 | `occupancy_weight` / `overhang_weight` sweep | | | | Pick the knee |
-| | 2 | Capacity sweep: `conv_channels ∈ {192, 256, 320}` | | | | Record per-chunk latency at each |
+| 2026-07-31 | 2 | Multi-run columns, rehearsal | 2.9833% (400 regions) | 0.0000% (shipped-default checkpoint; **0.0000% on all 14 sweep checkpoints**) | 0% | Go/no-go condition 1: ≥ baseline + 5.0 pts. Marginal baseline itself is 0.0000%, so GT's own margin is +2.98 pts — **below the 5.0-pt bar**; the model's is +0.00 pts. FAIL |
+| 2026-07-31 | 2 | Walkable-void *count* retention, rehearsal | 119,330 voids (1.103/1000 cols) | 0 (all 14 checkpoints) | 0% | Go/no-go condition 2: ≥ 25%. World y (`--checkpoint` supplies the heightmap head's own output as the model-side anchor). FAIL |
+| 2026-07-31 | 2 | Walkable-void *mean floor area* retention | 23.0 floor cells/void | 0.0 (undefined — 0 voids) | 0% | Go/no-go condition 3: ≥ 25% — rejects shattering. Not computed by `diagnose_overhangs.py`'s own verdict; computed manually from `floor_cells/void_count` on both sides (see CHANGELOG). FAIL |
+| 2026-07-31 | 2 | p90 cavity height, rehearsal | 16 blocks | 0 blocks (all 14 checkpoints) | — | Go/no-go condition 4: ≥ 3 blocks — rejects speckle. Model band has zero roofed cavities of any height. FAIL |
+| 2026-07-31 | 2 | Relief retention (must not regress from v1.1.1) | — | 22.00% (shipped-default); 15.77–22.00% across the 14 sweep checkpoints | — | v1.1.1 has not been trained (§0.1); compared against v1.1.0's ~21% instead, per TRAINING.md. Shipped-default checkpoint (22.00%) does not regress; several sweep points (16–20%) are within noise of a single 400-step run and not distinguishable from the baseline at this sample size. No dedicated tool computes this — measured ad hoc (mean per-chunk height std, prediction/target, over the 3,200-sample val split) |
+| 2026-07-31 | 2 | Biome accuracy (must not regress) | — | 62.79% (shipped-default); 45.61–81.95% across the 14 sweep checkpoints | — | No tool in the repo computes this (`diagnose_speckle.py` measures a prediction's own spatial self-consistency, not agreement with target). Measured ad hoc: per-cell `argmax(biome_logits) == biome_grid` over the same val split. No prior baseline exists to compare against (v1.1.0/v1.1.1 never measured this) |
+| 2026-07-31 | 2 | `occupancy_weight` / `overhang_weight` sweep | — | — | — | **No knee exists to pick**: multi-run rate is 0.0000% at every one of 12 tested weight points (`overhang_weight` ∈ {0.0003, 0.001, 0.003, 0.01, 0.03, 1.0}, `occupancy_weight` ∈ {0.25, 0.5, 1.0, 2.0}, `consistency_weight` ∈ {0.05, 0.1, 0.25, 0.5}), so the tradeoff curve §3.4 asks to find a knee on does not exist at 400-step rehearsal scale. See CHANGELOG for the full table and the recommended (unconfirmed) starting point for a longer follow-up sweep |
+| 2026-07-31 | 2 | Capacity sweep: `conv_channels ∈ {192, 256, 320}` | — | — | — | Same null result at all three widths (0.0000% multi-run). Latency (this Mac, not the target mid-range GPU): 192ch 17.0ms MPS / 35.1ms CPU; 256ch 11.5ms MPS / 23.9ms CPU; 320ch 12.7ms MPS / 26.2ms CPU (medians, batch=1) — all comfortably under the 100ms target; differences between widths are within measurement noise on this hardware and not a reliable ordinal signal |
 | | 3 | Full-run overhang metrics, 8000 regions | | | | |
 | | 4 | Per-chunk inference latency, mid-range GPU | — | | — | Target `<100ms` (`project-outline.md` §2.2) |
 | | 4 | Walkable voids per 100 chunks, benchmark prompts | | | | The number that matches the screenshot |

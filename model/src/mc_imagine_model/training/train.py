@@ -145,12 +145,18 @@ def move_batch(batch: Dict[str, Any], device: torch.device, non_blocking: bool =
 
 
 def build_targets(batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    return {
+    targets = {
         "heightmap": batch["heightmap"],
         "profile_id": batch["profile_id"],
         "water_level": batch["water_level"],
         "biome_grid": batch["biome_grid"],
     }
+    # Absent for pre-Phase-4 shard directories; CombinedLoss falls back to a zero occupancy/overhang
+    # loss when this is missing, which silently makes occupancy_weight/overhang_weight no-ops — do
+    # not drop this key, or a volumetric sweep trains on the pre-Phase-4 objective without warning.
+    if "occupancy_band" in batch:
+        targets["occupancy_band"] = batch["occupancy_band"]
+    return targets
 
 
 def assert_targets_representable(loader: DataLoader, num_batches: int = 4) -> None:
@@ -259,6 +265,87 @@ def load_checkpoint(path: str, model: nn.Module, optimizer, scheduler, scaler,
         path, start_epoch, global_step, best_val_loss,
     )
     return start_epoch, global_step, best_val_loss
+
+
+def evaluate_validation(
+    model: nn.Module,
+    val_loader: DataLoader,
+    criterion: CombinedLoss,
+    device: torch.device,
+    pin_memory: bool,
+    use_amp: bool,
+) -> Tuple[float, Dict[str, float]]:
+    """Runs evaluation over val_loader and returns (val_loss, val_components)."""
+    model.eval()
+    val_loss_total = 0.0
+    val_component_totals: Dict[str, float] = {}
+    val_count = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            batch = move_batch(batch, device, non_blocking=pin_memory)
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
+                if use_amp else nullcontext()
+            )
+            with autocast_ctx:
+                preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
+                targets = build_targets(batch)
+                loss, loss_dict = criterion(preds, targets)
+            val_loss_total += loss.item()
+            for name, value in loss_dict.items():
+                val_component_totals[name] = val_component_totals.get(name, 0.0) + value.item()
+            val_count += 1
+    val_loss = val_loss_total / max(1, val_count)
+    val_components = {
+        name: total / max(1, val_count) for name, total in val_component_totals.items()
+    }
+    return val_loss, val_components
+
+
+def run_validation_and_checkpoint(
+    model: nn.Module,
+    val_loader: DataLoader,
+    criterion: CombinedLoss,
+    device: torch.device,
+    pin_memory: bool,
+    use_amp: bool,
+    checkpoint_dir: str,
+    epoch: int,
+    global_step: int,
+    best_val_loss: float,
+    optimizer: Any,
+    scheduler: Any,
+    scaler: Any,
+    config: Dict[str, Any],
+    save_epoch_ckpt: bool = True,
+) -> float:
+    """Evaluates validation loss and saves best.pt, last.pt, and optionally epoch_XXX.pt.
+
+    Returns the updated best_val_loss.
+    """
+    val_loss, val_components = evaluate_validation(
+        model, val_loader, criterion, device, pin_memory, use_amp
+    )
+    val_components_str = ", ".join(f"{name}={value:.4f}" for name, value in val_components.items())
+    logger.info("=== epoch %d val_loss=%.4f (%s) ===", epoch, val_loss, val_components_str)
+
+    if save_epoch_ckpt:
+        ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+        save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, config,
+                        epoch, global_step, val_loss, best_val_loss)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        save_checkpoint(os.path.join(checkpoint_dir, "best.pt"), model, optimizer,
+                        scheduler, scaler, config, epoch, global_step, val_loss, best_val_loss)
+        logger.info("New best checkpoint (val_loss=%.4f) saved.", val_loss)
+
+    # `last.pt` is what --resume wants after a crash, independent of which epoch was best.
+    save_checkpoint(os.path.join(checkpoint_dir, "last.pt"), model, optimizer, scheduler,
+                    scaler, config, epoch, global_step, val_loss, best_val_loss)
+
+    return best_val_loss
+
 
 
 def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optional[str] = None) -> None:
@@ -426,68 +513,36 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
 
             if step % train_cfg.get("log_every", 50) == 0:
                 lr = optimizer.param_groups[0]["lr"]
+                components_str = ", ".join(
+                    f"{name}={value.item():.4f}" for name, value in loss_dict.items()
+                )
                 logger.info(
-                    "epoch %d step %d/%d loss=%.4f (terrain=%.4f, biome=%.4f, relief=%.4f) lr=%.6g",
+                    "epoch %d step %d/%d loss=%.4f (%s) lr=%.6g",
                     epoch, step, steps_per_epoch,
                     loss.item(),
-                    loss_dict["terrain"].item(),
-                    loss_dict["biome"].item(),
-                    loss_dict["relief"].item(),
+                    components_str,
                     lr,
                 )
 
             if max_steps is not None and global_step >= max_steps:
-                logger.info("Reached max_steps=%d, stopping early (smoke test mode).", max_steps)
+                logger.info("Reached max_steps=%d, running validation and saving checkpoints before exit.", max_steps)
+                best_val_loss = run_validation_and_checkpoint(
+                    model, val_loader, criterion, device, pin_memory, use_amp,
+                    checkpoint_dir, epoch, global_step, best_val_loss,
+                    optimizer, scheduler, scaler, config, save_epoch_ckpt=False,
+                )
                 return
 
         train_loss = running_loss / max(1, running_count)
         epoch_time = time.time() - epoch_t0
         logger.info("=== epoch %d done: train_loss=%.4f, time=%.1fs ===", epoch, train_loss, epoch_time)
 
-        val_loss = float("nan")
         if (epoch + 1) % train_cfg.get("val_every_epochs", 1) == 0:
-            model.eval()
-            val_loss_total = 0.0
-            val_t_total = 0.0
-            val_b_total = 0.0
-            val_r_total = 0.0
-            val_count = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    batch = move_batch(batch, device, non_blocking=pin_memory)
-                    autocast_ctx = (
-                        torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True)
-                        if use_amp else nullcontext()
-                    )
-                    with autocast_ctx:
-                        preds = model(batch["prompt_tokens"], batch["chunk_x"], batch["chunk_z"], batch["seed"])
-                        targets = build_targets(batch)
-                        loss, loss_dict = criterion(preds, targets)
-                    val_loss_total += loss.item()
-                    val_t_total += loss_dict["terrain"].item()
-                    val_b_total += loss_dict["biome"].item()
-                    val_r_total += loss_dict["relief"].item()
-                    val_count += 1
-            val_loss = val_loss_total / max(1, val_count)
-            val_t = val_t_total / max(1, val_count)
-            val_b = val_b_total / max(1, val_count)
-            val_r = val_r_total / max(1, val_count)
-            logger.info(
-                "=== epoch %d val_loss=%.4f (terrain=%.4f, biome=%.4f, relief=%.4f) ===",
-                epoch, val_loss, val_t, val_b, val_r,
+            best_val_loss = run_validation_and_checkpoint(
+                model, val_loader, criterion, device, pin_memory, use_amp,
+                checkpoint_dir, epoch, global_step, best_val_loss,
+                optimizer, scheduler, scaler, config, save_epoch_ckpt=True,
             )
-
-            ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
-            save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, config,
-                            epoch, global_step, val_loss, best_val_loss)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_checkpoint(os.path.join(checkpoint_dir, "best.pt"), model, optimizer,
-                                scheduler, scaler, config, epoch, global_step, val_loss, best_val_loss)
-                logger.info("New best checkpoint (val_loss=%.4f) saved.", val_loss)
-            # `last.pt` is what --resume wants after a crash, independent of which epoch was best.
-            save_checkpoint(os.path.join(checkpoint_dir, "last.pt"), model, optimizer, scheduler,
-                            scaler, config, epoch, global_step, val_loss, best_val_loss)
 
         if (epoch + 1) % train_cfg.get("qualitative_dump_every_epochs", 1) == 0:
             dump_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}_qualitative.png")

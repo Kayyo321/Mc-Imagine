@@ -93,6 +93,10 @@ DEFAULT_BASELINE_MARGIN_PTS = 5.0
 # Gate 2's second condition (§7, as amended): the model must retain at least this fraction of ground
 # truth's walkable voids. 0.25 is the plan's number, not this tool's invention.
 DEFAULT_MIN_VOID_RETENTION = 0.25
+# Gate 2's third condition (docs/phase4.1-plan.md §2.4): walkable mean floor area retention.
+DEFAULT_MIN_MEAN_FLOOR_RETENTION = 0.25
+# Gate 2's fifth condition (§7, docs/phase4.1-plan.md §2.4): relief retention.
+DEFAULT_MIN_RELIEF_RETENTION = 0.20
 
 DEFAULT_PROMPT = "a towering sandstone cliff with a deep undercut you can shelter beneath"
 
@@ -861,14 +865,19 @@ def evaluate_baseline_gate(
     margin_pts: float = DEFAULT_BASELINE_MARGIN_PTS,
     gt_metrics: Optional[Dict[str, Any]] = None,
     min_void_retention: float = DEFAULT_MIN_VOID_RETENTION,
+    min_mean_floor_retention: float = DEFAULT_MIN_MEAN_FLOOR_RETENTION,
+    observed_relief_retention: Optional[float] = None,
+    min_relief_retention: float = DEFAULT_MIN_RELIEF_RETENTION,
 ) -> Dict[str, Any]:
-    """Gate 2's go/no-go (docs/phase4-plan.md §7), which is a **conjunction of three conditions**:
+    """Gate 2's go/no-go (docs/phase4-plan.md §7, docs/phase4.1-plan.md §2.4), which is a **conjunction of five conditions**:
 
         1. multi-run column rate >= marginal baseline + `margin_pts`
         2. walkable-void retention >= `min_void_retention` of ground truth
-        3. p90 cavity height >= `min_walkable_height` (the observed side's own setting)
+        3. walkable mean floor area retention >= `min_mean_floor_retention` of ground truth
+        4. p90 cavity height >= `min_walkable_height` (the observed side's own setting)
+        5. relief retention >= `min_relief_retention` (if observed_relief_retention is provided)
 
-    ALL THREE, or the verdict is FAIL. It is not a headline number with warnings attached, because
+    ALL FIVE (or all applicable), or the verdict is FAIL. It is not a headline number with warnings attached, because
     a warning next to the word PASS is a warning nobody acts on.
 
     WHY IT IS A CONJUNCTION, MEASURED. Condition 1 alone is gameable by the exact failure §3.1
@@ -877,9 +886,9 @@ def evaluate_baseline_gate(
     columns against a 0.00% baseline (+100.00 points, the most emphatic possible PASS) while
     containing nothing a player can enter: every cavity is exactly 1 block tall (p50 = p90 = max =
     1) and there are 0 walkable voids. Under the conjunction it now reads FAIL on conditions 2 and
-    3. `test_baseline_gate_speckle_fails_the_conjunction` reproduces the fixture and pins all of it.
+    4. `test_baseline_gate_speckle_fails_the_conjunction` reproduces the fixture and pins all of it.
 
-    Condition 3 is what kills it, and it is deliberately p90 rather than "are there any walkable
+    Condition 4 is what kills it, and it is deliberately p90 rather than "are there any walkable
     voids at all". An earlier version of this check keyed on `voids == 0`, and adding ONE 4x4 room
     to 0.39% of the columns flipped that to false and silenced the entire warning while the band was
     still 99.6% speckle. A percentile cannot be bought off that cheaply.
@@ -892,14 +901,10 @@ def evaluate_baseline_gate(
     scores double the speckle (33.3% vs 16.7%). An earlier draft of this docstring asserted the
     ordering was stable; the test fixture disproved it. The claim that survives is the weaker and
     sufficient one: a band with ZERO enterable structure can post a large overhang percentage, so
-    the metric cannot stand in for conditions 2 and 3.
-
-    NOT IN SCOPE HERE: §7's fourth condition, "relief retention not regressed from v1.1.1". That is
-    measured by the terrain tooling, not this one. `main` prints a line saying so, because a PASS
-    from this tool is three quarters of the gate and must not be read as all of it.
+    the metric cannot stand in for conditions 2, 3, and 4.
 
     `gt_metrics` is optional. Without it (a Gate 0 ground-truth-only run) there is no model and no
-    retention, so condition 2 is not evaluable; conditions are then reported as measured on the
+    retention, so conditions 2 and 3 are not evaluable; conditions are then reported as measured on the
     ground truth itself and `is_gate2_verdict` is False. That run is a check that the DATA has
     structure the average band does not — useful, and not a Gate 2 decision.
     """
@@ -917,18 +922,63 @@ def evaluate_baseline_gate(
 
     height_met = bool(p90 >= min_h)
 
+    # Derived mean floor area per void for observed metrics: floor_cells / void_count (0.0 if void_count == 0)
+    obs_floor_cells = float(walk.get("floor_cells", 0.0))
+    obs_void_count = float(walk.get("void_count", 0.0))
+    obs_mean_floor = (obs_floor_cells / obs_void_count) if obs_void_count > 0.0 else 0.0
+
+    is_gate2 = gt_metrics is not None
+
     retention: Optional[float] = None
-    if gt_metrics is not None:
+    retention_met: Optional[bool] = None
+
+    mean_floor_retention: Optional[float] = None
+    mean_floor_retention_met: Optional[bool] = None
+
+    if is_gate2:
         gt_voids = float(gt_metrics["walkable"]["voids_per_1000_columns"])
         # Undefined, not 0.0 and not inf: ground truth with no walkable voids cannot say whether a
         # model retained them. An undefined condition is NOT met — the gate authorizes a 9-hour run
         # and must not do so on an unmeasurable criterion.
-        retention = float(voids / gt_voids) if gt_voids != 0.0 else None
-    retention_met = bool(retention is not None and retention >= min_void_retention)
+        if gt_voids != 0.0:
+            retention = float(voids / gt_voids)
+            retention_met = bool(retention >= min_void_retention)
+        else:
+            retention = None
+            retention_met = False
 
-    is_gate2 = gt_metrics is not None
-    # Flipping any condition in or out of the verdict is this one line, by design.
-    passed = margin_met and height_met and (retention_met if is_gate2 else True)
+        gt_walk = gt_metrics.get("walkable", {})
+        gt_floor_cells = float(gt_walk.get("floor_cells", 0.0))
+        gt_void_count = float(gt_walk.get("void_count", 0.0))
+
+        if gt_void_count == 0.0 and obs_void_count == 0.0:
+            # Neither side has any walkable void — there is nothing to retain, so this passes
+            # vacuously rather than reporting an undefined 0/0 as a failure.
+            mean_floor_retention = None
+            mean_floor_retention_met = True
+        elif gt_void_count == 0.0:
+            # Ground truth has no walkable voids to measure floor area against, but the model
+            # produced some — undefined, and (like condition 2) an undefined condition is NOT met.
+            mean_floor_retention = None
+            mean_floor_retention_met = False
+        else:
+            gt_mean_floor = gt_floor_cells / gt_void_count
+            if gt_mean_floor != 0.0:
+                mean_floor_retention = float(obs_mean_floor / gt_mean_floor)
+                mean_floor_retention_met = bool(mean_floor_retention >= min_mean_floor_retention)
+            else:
+                mean_floor_retention = None
+                mean_floor_retention_met = False
+
+    relief_met: Optional[bool] = None
+    if observed_relief_retention is not None:
+        relief_met = bool(observed_relief_retention >= min_relief_retention)
+
+    passed = margin_met and height_met
+    if is_gate2:
+        passed = passed and (retention_met is True) and (mean_floor_retention_met is True)
+    if observed_relief_retention is not None:
+        passed = passed and (relief_met is True)
 
     return {
         "observed_multi_run_column_pct": observed,
@@ -941,10 +991,17 @@ def evaluate_baseline_gate(
         "observed_voids_per_1000_columns": voids,
         "walkable_void_retention": retention,
         "required_void_retention": float(min_void_retention),
+        "observed_mean_floor_cells_per_void": obs_mean_floor,
+        "walkable_mean_floor_retention": mean_floor_retention,
+        "required_mean_floor_retention": float(min_mean_floor_retention),
+        "observed_relief_retention": observed_relief_retention,
+        "required_relief_retention": float(min_relief_retention),
         "conditions": {
             "multi_run_margin": margin_met,
             "walkable_void_retention": retention_met if is_gate2 else None,
+            "walkable_mean_floor_retention": mean_floor_retention_met if is_gate2 else None,
             "p90_cavity_height": height_met,
+            "relief_retention": relief_met if observed_relief_retention is not None else None,
         },
         "is_gate2_verdict": is_gate2,
         "verdict": "PASS" if passed else "FAIL",
@@ -1270,26 +1327,38 @@ def print_report(
     print(f"    2. walkable-void retention {ret_s:>10} "
           f"(need >= {gate['required_void_retention'] * 100:.0f}%)"
           f" ->{_mark(cond['walkable_void_retention'])}")
-    print(f"    3. p90 cavity height    {gate['observed_p90_cavity_height']:>3} blocks "
+    mf_ret = gate.get("walkable_mean_floor_retention")
+    mf_s = "undefined" if mf_ret is None else f"{mf_ret * 100:.2f}%"
+    obs_mf = gate.get("observed_mean_floor_cells_per_void", 0.0)
+    print(f"    3. mean floor area retention {mf_s:>8} "
+          f"(need >= {gate['required_mean_floor_retention'] * 100:.0f}%; obs mean is "
+          f"{obs_mf:.2f} cells/void)"
+          f" ->{_mark(cond['walkable_mean_floor_retention'])}")
+    print(f"    4. p90 cavity height    {gate['observed_p90_cavity_height']:>3} blocks "
           f"(need >= {gate['required_p90_cavity_height']}; p50 is "
           f"{gate['observed_p50_cavity_height']})"
           f" ->{_mark(cond['p90_cavity_height'])}")
+    rel_ret = gate.get("observed_relief_retention")
+    rel_s = "n/a" if rel_ret is None else f"{rel_ret * 100:.2f}%"
+    print(f"    5. relief retention    {rel_s:>10} "
+          f"(need >= {gate['required_relief_retention'] * 100:.0f}%)"
+          f" ->{_mark(cond['relief_retention'])}")
+
     if gate["baseline_is_degenerate"]:
         print("  NOTE: baseline multi-run rate is 100% — the AVERAGE band itself has multiple solid")
         print("        runs, so condition 1 is no longer informative. Look at it before trusting")
         print("        the verdict either way (see marginal_baseline_band's docstring).")
     if is_gate2:
         failed = [n for n, ok in cond.items() if ok is False]
-        why = "all three conditions met" if gate["verdict"] == "PASS" else \
+        why = "all conditions met" if gate["verdict"] == "PASS" else \
             "failed: " + ", ".join(failed)
         print(f"  VERDICT: {gate['verdict']} — {why}")
-        print("  §7 has a FOURTH condition — relief retention must not regress from v1.1.1 — which")
-        print("  is measured by the terrain tooling, not this one. A PASS here is three quarters of")
-        print("  the gate.")
+        if cond.get("relief_retention") is None:
+            print("  NOTE: condition 5 (relief retention) was not supplied via --observed-relief-retention.")
     else:
         print(f"  DATA CHECK: {gate['verdict']} — this is Gate 0's check that the DATA has structure")
-        print("  the average band does not. It is NOT the Gate 2 verdict: condition 2 needs a model")
-        print("  to retain anything. Gate 2 reruns these same three lines against model output.")
+        print("  the average band does not. It is NOT the Gate 2 verdict: conditions 2 and 3 need a model")
+        print("  to retain anything. Gate 2 reruns these same lines against model output.")
     print("=" * 78)
 
 
@@ -1337,8 +1406,14 @@ def main() -> int:
                              f"required (default: {DEFAULT_BASELINE_MARGIN_PTS})")
     parser.add_argument("--min-void-retention", type=float, default=DEFAULT_MIN_VOID_RETENTION,
                         help="Gate 2 condition 2: fraction of ground truth's walkable voids the "
-                             f"model must retain (default: {DEFAULT_MIN_VOID_RETENTION}). "
-                             "Condition 3 is --min-walkable-height.")
+                             f"model must retain (default: {DEFAULT_MIN_VOID_RETENTION}).")
+    parser.add_argument("--min-mean-floor-retention", type=float, default=DEFAULT_MIN_MEAN_FLOOR_RETENTION,
+                        help="Gate 2 condition 3: fraction of ground truth's walkable mean floor area the "
+                             f"model must retain (default: {DEFAULT_MIN_MEAN_FLOOR_RETENTION}).")
+    parser.add_argument("--observed-relief-retention", type=float, default=None,
+                        help="Gate 2 condition 5: observed relief retention fraction from terrain tooling (default: None)")
+    parser.add_argument("--min-relief-retention", type=float, default=DEFAULT_MIN_RELIEF_RETENTION,
+                        help="Gate 2 condition 5: required min relief retention fraction (default: {DEFAULT_MIN_RELIEF_RETENTION}).")
     parser.add_argument("--checkpoint", default=None,
                         help="Alternative to --model: run inference to produce the model band. "
                              "Requires the occupancy head (Task B1).")
@@ -1492,6 +1567,9 @@ def main() -> int:
         args.baseline_margin,
         gt_metrics=gt_metrics if model_metrics is not None else None,
         min_void_retention=args.min_void_retention,
+        min_mean_floor_retention=args.min_mean_floor_retention,
+        observed_relief_retention=args.observed_relief_retention,
+        min_relief_retention=args.min_relief_retention,
     )
     print_report(gt_metrics, model_metrics, baseline_metrics, retention, gate)
 
@@ -1504,7 +1582,10 @@ def main() -> int:
             "model_source": model_source,
             "regions": len(gt_paths),
             "settings": dict(kw, model_layout=args.model_layout,
-                             min_void_retention=args.min_void_retention),
+                             min_void_retention=args.min_void_retention,
+                             min_mean_floor_retention=args.min_mean_floor_retention,
+                             observed_relief_retention=args.observed_relief_retention,
+                             min_relief_retention=args.min_relief_retention),
             "floor_space": gt_metrics["walkable"]["floor_space"],
             "floor_space_downgraded_to_match_model": mixed,
             "ground_truth": gt_metrics,
