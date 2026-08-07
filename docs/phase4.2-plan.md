@@ -251,7 +251,15 @@ checks, all on `model/data` (the retuned dataset) and `training_runs/phase42_reh
 |---|---|---|
 | Loss of a heightfield-only vs. real-cave vs. matched-rate-speckle prediction, under the shipped objective (`extra_transition_weight=100.0`, `overhang_weight=4.0`) | heightfield **1.3903**, real caves **0.0005**, speckle **1.5415** | The objective **strongly prefers real caves** — by ~3 orders of magnitude — and rates speckle *worse than doing nothing*. The loss is not what produced speckle. |
 | Per-term gradient norms on cave-bearing chunks, at three confidence levels | occupancy 0.0066–0.0077, `4.0 ×` overhang 0.0007–0.0008 (ratio 0.1×); clamp dead-zone cells: **0** | No gradient pathology, no dead zone, overhang term is a minor contributor. Not a scale problem. |
-| Sub-surface (below topmost solid) cave-placement agreement, 12 carved regions, each fed its **own** world seed and chunk coords, 6.75M cells | model sub-surface air 1.36% vs truth 1.95%; IoU **0.0147**; Pearson **r = 0.0133**; lift over chance **1.81×**; model cavity heights mean 1.00 / max **1**, truth mean 8.20 / p90 16 / max 28 | **The model never learned cave placement at all.** It reproduces roughly the right *amount* of sub-surface air at essentially random locations. |
+| Sub-surface (below topmost solid) cave-placement agreement, 2048 chunks drawn through the real `McImagineDataset`, 32.0M cells | model sub-surface air 0.32% vs truth 1.28%; IoU **0.0151**; Pearson **r = 0.0310**; lift over chance **5.78×**; shuffled-pairing control r = **0.0001**; model cavity heights mean 1.00 / max **1**, truth mean 8.20 / p90 16 / max 28 | **The model never learned cave placement.** It emits sub-surface air at near-random locations, and under-produces it 4:1. |
+
+> The placement row must be measured through `McImagineDataset`, not by slicing `band` directly. The
+> dataset slices at `[z0+HALO_MARGIN : z0+HALO_MARGIN+16]` while `chunk_x_global = region_x *
+> CHUNKS_PER_REGION_SIDE + cx`; hand-slicing from canvas index 0 shifts the target 4 blocks against
+> the coordinates fed to the model, which on a field whose finest octave is λ≈12.8 blocks is a third
+> of a wavelength and depresses r on its own. The first pass at this check made exactly that error
+> and reported r = 0.013; the corrected figure is 0.031. The conclusion is unchanged — both are
+> chance against a 0.0001 control — but any re-measurement must go through the dataset.
 
 The failure is therefore **not** a loss-design or loss-weight problem. It is that the model did not
 learn the coordinate→structure mapping, and so fell back on predicting the marginal sub-surface air
@@ -285,7 +293,7 @@ Renting is justified when **all** of these hold. Not four of five.
       hit; see §6's log). Documented and stopped per operator direction, not iterated further.
       **§6.1 (2026-08-07) supersedes that row's root-cause attribution:** measured, the objective
       prefers real caves over speckle by ~3 orders of magnitude and the gradients are clean — the
-      model simply never learned cave placement (sub-surface Pearson r = 0.013, i.e. chance). This
+      model simply never learned cave placement (sub-surface Pearson r = 0.031 against a 0.0001 control, i.e. chance). This
       is an open research question, not a weight left untuned, and it is the single thing standing
       between this project and a justified rental.
 - [x] `preflight` on `config.cuda.yaml` is clean except the two known-correct Darwin failures (6.1).
