@@ -37,6 +37,7 @@ docs/model-spec.md's coordinate-conditioning design, `model/positional.py`'s `Co
 without any extra padding logic at slice time.
 """
 
+import os
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Tuple
 
@@ -363,14 +364,39 @@ PERLIN3D_NORM = 1.0
 # component. Volume alone would not have caught that, and neither would the share alone.
 #
 # The carve gains multiply the FIELD rather than moving the threshold. That form is chosen for one
-# property: at `gain == 0` the test is `0 < -0.35`, false for every cell, so "strength 0 carves
-# nothing" is a *proof* and not a measurement. This is now the only operator — the arch's
+# property: at `gain == 0` the test is `0 < CARVE_THRESHOLD`, false for every cell, so "strength 0
+# carves nothing" is a *proof* and not a measurement. This is now the only operator — the arch's
 # level-set variant was removed — so the proof covers every 3D feature with no asterisk. (Moving
 # the threshold instead would need it pushed below the field's infimum to be provably inert, which
-# compresses the whole useful parameter range into the top fifth of [0, 1].) Effective threshold is
-# `CARVE_THRESHOLD / gain`, so gain 0.85 -> -0.412 -> ~0.5% of cells before gating, gain 1.0 ->
-# 1.58%, gain 1.15 -> -0.304 -> ~3.4%, gain 1.30 -> -0.269 -> ~5.7%.
-CARVE_THRESHOLD = -0.35
+# compresses the whole useful parameter range into the top fifth of [0, 1].)
+#
+# RETUNED to -0.24, docs/phase4.2-plan.md §1.1/§1.3 (was -0.35). §1.3 measured that ground truth's
+# own multi-run column rate (2.98-3.04% at -0.35) does not clear Gate 2 condition 1's +5.0-point
+# margin over a 0% baseline — a model that reproduced the data exactly would fail the gate, so
+# there was no reachable target for the loss work in §3 to aim at. -0.24 was chosen empirically by
+# sweeping toward 0 (widening the sublevel set — the table above) and measuring with the real
+# `diagnose_overhangs.py` metrics functions, not by moving `carve_frequency`/`hoodoo_frequency`
+# (pinned, see their own fields below) or any per-archetype gain:
+#
+#     threshold  multi_run%  solid_frac  p90_cavity  clipped_at_floor  voids/1000cols  (n=80 regions)
+#      -0.35        ~3.0        0.965        17            0               ~1.0
+#      -0.27         6.85       0.958        20            0                2.13  (n=32)
+#      -0.25         8.19       0.955        20            0                2.52  (n=32)
+#      -0.24         9.51       0.952        21            0                2.92
+#      -0.23        10.35       0.950        22            0                3.16
+#      -0.22        11.23       0.948        22            0                3.39
+#
+# -0.24 clears the 8.0% floor (docs/phase4.2-plan.md §1.1) with a ~1.5-point margin against
+# sampling noise at full 400/8000-region scale, while sitting the furthest of the viable candidates
+# from the percolation risk the paragraph above measured approaching -0.20 (11.9% of volume in a
+# handful of components, pre-gate) — the least aggressive change that reaches the target. Every
+# quality bound in docs/phase4.2-plan.md §1.2 holds with room to spare: solid fraction 0.952 (band
+# [0.93, 0.98]), p90 cavity 21 (band [3, 48]), max cavity well under 48, zero band-floor clipping,
+# and walkable voids/1000 columns nearly 3x the 0.685 floor. Effective threshold is
+# `CARVE_THRESHOLD / gain`, so at -0.24: gain 0.85 -> -0.282 -> ~4.9% of cells before gating,
+# gain 1.0 -> ~7.5%, gain 1.15 -> -0.209 -> ~11.6%, gain 1.30 -> -0.185 -> ~14.6% (read off the
+# tail table above by interpolation).
+CARVE_THRESHOLD = -0.24
 
 # Below this the region is treated as having NO 3D carving at all and the `_fbm3d` call is skipped.
 # The four flat archetypes are pinned to exactly 0.0, so this is an exact test in practice; the
@@ -1895,7 +1921,8 @@ class ProceduralWorldSource:
             "params": asdict(params),
         }
 
-    def generate_shards(self, num_regions: int, out_dir: str, region_layout_width: int = 64) -> List[str]:
+    def generate_shards(self, num_regions: int, out_dir: str, region_layout_width: int = 64,
+                        max_workers: int = 1) -> List[str]:
         """Samples `num_regions` macro-regions and writes one `.npz` shard each to `out_dir`.
         Region (x, z) coordinates are laid out on a grid purely for bookkeeping/filenames. Since
         `sample_params` draws an independent *world seed* per region (and the world seed translates
@@ -1905,29 +1932,71 @@ class ProceduralWorldSource:
         world seed and parameter vector, which is the property the trained model has to reproduce
         at inference time (and which `render_region`'s global-coordinate sampling guarantees).
 
+        `max_workers > 1` (docs/phase4.2-plan.md §2.1) farms regions out to a `ProcessPoolExecutor`,
+        one region per task (`chunksize=1` via individual `submit` calls — NOT a contiguous
+        `map`-style split). Each region is a pure function of `(self.seed, region_x, region_z)` with
+        no shared mutable state, so parallel execution changes nothing about what gets written —
+        every shard is byte-identical to the sequential path, only the wall clock changes. One
+        region per task rather than a contiguous range per worker because region cost is bimodal
+        (carved ~8.0s, uncarved ~0.33s — see `CARVE_STRENGTH_EPS`'s skip path) and archetype
+        assignment is not spatially correlated with region id; chunking by range would let one
+        worker draw an unlucky run of carving regions while another idles on flat ones.
+
         Because the field is WORLD_PERIOD-periodic, every shard — wherever it sits on the layout
         grid — samples the same 2048x2048 canonical domain. 600 regions of 512x512 therefore cover
         that domain ~37x over, and 8000 regions ~500x. The alternative (a 65536-block offset window)
         spread the same shards over a 1024x larger domain at ~3% coverage, which is a memorization
         problem rather than a regression problem."""
-        import os
-
         os.makedirs(out_dir, exist_ok=True)
-        paths = []
-        for region_id in range(num_regions):
-            rx = region_id % region_layout_width
-            rz = region_id // region_layout_width
-            params = self.sample_params(rx, rz)
-            region = self.render_region(params)
-            path = os.path.join(out_dir, f"region_{region_id:05d}.npz")
-            np.savez_compressed(
-                path,
-                heightfield=region["heightfield"],
-                band=region["band"],
-                profile_map=region["profile_map"],
-                biome_map=region["biome_map"],
-                water_level=region["water_level"],
-                **{f"param_{k}": v for k, v in region["params"].items()},
-            )
-            paths.append(path)
+        region_ids = range(num_regions)
+
+        if max_workers <= 1:
+            return [
+                _render_and_save_region(self.seed, region_id, region_layout_width, out_dir)
+                for region_id in region_ids
+            ]
+
+        # One `submit` per region (not `executor.map`'s contiguous chunking) — see the docstring.
+        # `self` is never pickled/sent to the worker: only `self.seed` (an int) and the region
+        # coordinates cross the process boundary, and `_render_and_save_region` reconstructs its own
+        # `ProceduralWorldSource` inside the worker, so there is no shared state to synchronize.
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        paths: List[str] = [""] * num_regions
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_render_and_save_region, self.seed, region_id, region_layout_width,
+                                out_dir): region_id
+                for region_id in region_ids
+            }
+            for future in as_completed(futures):
+                region_id = futures[future]
+                paths[region_id] = future.result()
         return paths
+
+
+def _render_and_save_region(seed: int, region_id: int, region_layout_width: int, out_dir: str) -> str:
+    """One region's worth of `ProceduralWorldSource.generate_shards`'s loop body, factored out to
+    module scope so it is picklable for `ProcessPoolExecutor.submit` (docs/phase4.2-plan.md §2.1).
+
+    Reconstructs its own `ProceduralWorldSource(seed)` rather than receiving one, so nothing but
+    plain ints/strings crosses the process boundary — `render_region` depends only on `(seed,
+    region_x, region_z)`, never on anything the source object accumulates, so a fresh instance per
+    call is identical to reusing one. The sequential path in `generate_shards` calls this same
+    function so the two paths cannot silently diverge.
+    """
+    rx = region_id % region_layout_width
+    rz = region_id // region_layout_width
+    source = ProceduralWorldSource(seed=seed)
+    params = source.sample_params(rx, rz)
+    region = source.render_region(params)
+    path = os.path.join(out_dir, f"region_{region_id:05d}.npz")
+    np.savez_compressed(
+        path,
+        heightfield=region["heightfield"],
+        band=region["band"],
+        profile_map=region["profile_map"],
+        biome_map=region["biome_map"],
+        water_level=region["water_level"],
+        **{f"param_{k}": v for k, v in region["params"].items()},
+    )
+    return path

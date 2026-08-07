@@ -185,7 +185,17 @@ class PromptEncoder(nn.Module):
     separately.
     """
 
-    def __init__(self, checkpoint_dir: Optional[str] = None, embed_dim: int = HIDDEN_SIZE) -> None:
+    def __init__(self, checkpoint_dir: Optional[str] = None, embed_dim: int = HIDDEN_SIZE,
+                allow_random: bool = False) -> None:
+        """
+        Args:
+            allow_random: if the pretrained checkpoint is missing, `False` (the default) raises —
+                `model/checkpoints/` is gitignored, so a fresh clone is one forgotten `bootstrap`
+                away from training a model that converges and has learned nothing about text
+                (docs/remote-training-readiness-plan.md §2.E2). Pass `True` (train.py's
+                `--allow-random-text-encoder`) to explicitly accept a randomly-initialized,
+                non-semantic encoder instead — e.g. for an architecture-only smoke test.
+        """
         super().__init__()
         self.embed_dim = embed_dim
         self.backbone = MiniLMBackbone()
@@ -195,16 +205,25 @@ class PromptEncoder(nn.Module):
         if checkpoint_dir and os.path.exists(os.path.join(checkpoint_dir, "model.safetensors")):
             load_pretrained_minilm(self.backbone, checkpoint_dir)
             self._loaded_from = checkpoint_dir
-        else:
-            # Documented fallback per docs/poc-plan.md: if the pretrained checkpoint is
-            # unavailable, fall back to a same-shape randomly-initialized encoder of identical
-            # architecture, still frozen after init (so seed-based determinism still holds). This
-            # changes what "training" actually learns — flagged loudly, not silently degraded.
+        elif allow_random:
+            # Documented fallback per docs/poc-plan.md, now opt-in only: a same-shape
+            # randomly-initialized encoder of identical architecture, still frozen after init (so
+            # seed-based determinism still holds). This changes what "training" actually learns —
+            # flagged loudly, and only reachable when explicitly requested.
             print(
                 "[PromptEncoder] WARNING: pretrained MiniLM checkpoint not found at "
-                f"{checkpoint_dir}. Falling back to a randomly-initialized, frozen encoder of the "
-                "same architecture. Text semantics will NOT be meaningful — this is a degraded "
-                "configuration, not the intended one."
+                f"{checkpoint_dir}. --allow-random-text-encoder was passed, so falling back to a "
+                "randomly-initialized, frozen encoder of the same architecture. Text semantics "
+                "will NOT be meaningful — this is a degraded configuration, not the intended one."
+            )
+        else:
+            raise RuntimeError(
+                f"PromptEncoder: no pretrained MiniLM checkpoint found at {checkpoint_dir!r}. "
+                "Training would converge with every prompt producing the same terrain "
+                "(docs/remote-training-readiness-plan.md §2.E2). Run "
+                "`python -m mc_imagine_model.scripts.bootstrap`, or pass "
+                "--allow-random-text-encoder to accept a degraded, non-semantic encoder "
+                "explicitly."
             )
         self.eval()
         for p in self.parameters():

@@ -38,15 +38,28 @@ training:
   relief_weight: 10.0
   # Phase 4 Gate 2 starting point; sweep before a full release run.
   occupancy_weight: 1.0
-  # Overhang loss weight. Lowered from 1.0 to 0.005 per Phase 4.1 recovery plan.
-  # High overhang weights (e.g. 1.0 or 0.05) caused severe loss instability and gradient clipping
-  # domination at Gate 2 (overhang loss spiked to ~243.0 at step 0). Empirical optimal range is [0.003, 0.01].
-  overhang_weight: 0.005
-  consistency_weight: 0.25
+  # Overhang loss weight. RETUNED for docs/phase4.2-plan.md §3.2/§3.3: OverhangLoss changed from
+  # an unnormalized per-chunk-count MSE (where the old [0.003, 0.01] range and the Phase 4.1
+  # instability it was calibrated against both lived) to a per-cell BCE, which is a different scale
+  # entirely and makes the old range meaningless. Swept from 1.0 (docs/phase4.2-plan.md §3.3's
+  # starting point) via loss_mass.py: at 4.0 the overhang term is 24.15% of total loss at a
+  # heightfield-only prediction (target band [15%, 40%] -- present, not dominant).
+  overhang_weight: 4.0
+  # Zeroed, not redesigned: ConsistencyLoss's residual is minimized by pushing soft_topmost toward
+  # the top of the band regardless of data (docs/remote-training-readiness-plan.md §2.H1). A live
+  # candidate contributor to Gate 2's uniform 0.0000% result. Decision is locked at 0.0 (§5 item 0.2);
+  # a corrected loss is a separate research change, not part of this fix.
+  consistency_weight: 0.0
   checkpoint_dir: "training_runs/rehearsal"  # relative paths resolve against model/ (see train.resolve_path)
   resume: null  # path to a .pt to resume from; --resume on the CLI overrides this
   log_every: 50
   val_every_epochs: 1
+  # docs/remote-training-readiness-plan.md §2.C1 — keep the last 3 epoch_NNN.pt files plus
+  # best.pt/last.pt (always overwritten in place, not rotated).
+  keep_last_n_checkpoints: 3
+  # docs/remote-training-readiness-plan.md §2.G1 — writes last.pt only (no validation pass) every
+  # save_every_steps. 0 disables. Paired with a SIGTERM/SIGINT handler that does the same.
+  save_every_steps: 500
   qualitative_dump_every_epochs: 1  # the PNG dump runs 6 prompts x 8x8 chunks on-device; less often on long runs
   target_range_check_batches: 8  # startup assert: all height/water targets inside the head's band
   seed: 1234  # identical to config.mps.yaml — seeding is device-independent so curves are comparable
@@ -58,8 +71,12 @@ data:
   augmentation: false  # see data/labeler.py's maybe_paraphrase — documented no-op, no LLM API available
   val_region_fraction: 0.08
   # With num_workers > 0 each worker holds its own shard cache, so the whole-split default would be
-  # multiplied by 8. Cap it; misses just re-read an .npz.
-  shard_cache_size: 512
+  # multiplied by 8. At 512 this was 56.49 GB at --target-regions 400 (78.29 GB at 8000) against a
+  # 17.18 GB Mac — the same OOM shape config.cuda.yaml was already fixed for
+  # (docs/remote-training-readiness-plan.md §1, §2.A1); rehearsal shares its hardware profile
+  # (num_workers: 8) and had not been re-checked. Matches cuda.yaml's value — docs/phase4.2-plan.md
+  # §0.1, "rehearsal is the *first* thing that runs on a rented box".
+  shard_cache_size: 8
 
 hardware:
   device: "cuda"

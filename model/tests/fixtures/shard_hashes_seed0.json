@@ -1,0 +1,15 @@
+{
+  "hashes": {
+    "region_00000.npz": "b0d1532bc6e74f98873260e87902f52a88cf17703d1f196b1e5df126ed5c1999",
+    "region_00001.npz": "2fe40274f26b941245e651da3ef1fb4bfe5590ccf55f53be2ac43ffec2ce9b2a",
+    "region_00002.npz": "a5f1bf0f7a4854503550133e6a8f015061156c71f7b8737d46091c0b8512c6d5",
+    "region_00003.npz": "2f239409c9b443abbf87f79bf1e18360b98fd9b9b1434a4963353a7de016047c",
+    "region_00004.npz": "11c3020a9756ecaaad7e10945bd827c9fb5c6f7fbdbfaeaa02da6240f9575b14",
+    "region_00005.npz": "5be67ab587019887557672368273ef9a7118279b0d0074806e00ad5c27ca2181",
+    "region_00006.npz": "45db7d798ce5f00f77df7b2d170e2c2e902f327074c81abba0471350dbc86f4a",
+    "region_00007.npz": "944de9f80a6468996c91c6e58ebdced75d35bdf2c657f875f5a41bfd499103dd"
+  },
+  "recorded_on": "Darwin-arm64",
+  "region_layout_width": 64,
+  "seed": 0
+}

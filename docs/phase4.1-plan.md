@@ -264,13 +264,14 @@ adds. Empty rows are the work — same convention as both prior plan documents.
 | 2026-07-31 | (context) | Gate 2, 14-checkpoint sweep, multi-run columns | 0.0000% on all 14 | See `docs/phase4-plan.md` §9 for the full table; this document exists because of this row |
 | 2026-07-31 | (context) | Ground truth's own multi-run rate vs. marginal baseline (400 rehearsal regions) | +2.98 pts (2.9833% vs. 0.0000%) | Below the default 5.0-pt bar — §1.3 |
 | 2026-07-31 | (context) | Baseline-config training instability | terrain 3.8→46.1, overhang 239→9.1 at step 150 | Root cause candidate for uniform-zero result — §1.2 |
-| | A | `train.py` checkpoint-on-`--max-steps` regression test | | Confirms §1.1's fix |
-| | B | Confirmatory run, `overhang_weight ∈ [0.003, 0.01]`, 2000–4000 steps: multi-run column % | | Branch point for Step C |
-| | B | Same run: occupancy loss curve past step 400 | | Undertrained vs. structural, per §2.2 |
-| | C (if B non-zero) | Re-swept `occupancy_weight` at corrected `overhang_weight` | | §1.2 |
-| | C (if B non-zero) | Re-swept `consistency_weight` at corrected `overhang_weight` | | §1.2 |
-| | C (if B non-zero) | Full 5-condition go/no-go, corrected config | | Real Gate 2 verdict |
-| | C (if B zero) | Occupancy head init bias (air/solid/marginal) | | §2.3 item 1 |
-| | C (if B zero) | Gradient magnitude, pre-upsample vs. 2D backbone at matched depth | | §2.3 item 2 |
-| | C (if B zero) | Transition-cell BCE weight, effective magnitude vs. ground-truth transition rate | | §2.3 item 3 |
+| 2026-07-31 | A | `train.py` checkpoint-on-`--max-steps` regression test | added, green (`model/tests/test_train.py`) | Confirms §1.1's fix — and this run's own `--max-steps 3000` wrote `epoch_NNN.pt`/`last.pt` correctly, a second confirmation |
+| 2026-08-05 | B | Confirmatory run, `overhang_weight: 0.005`, 3000 steps (`config.mps.yaml`, 400 regions): multi-run column % | **0.0000%** | Branch point for Step C — **zero.** Full gate: all of conditions 1/2/3/4 NOT MET, VERDICT FAIL (`scripts/diagnose_overhangs.py --checkpoint training_runs/mps_run1/last.pt --ground-truth model/data`) |
+| 2026-08-05 | B | Same run: occupancy loss curve past step 400 | falls 0.72→~0.025 by step ~450, then plateaus in [0.016, 0.05] through step 3000 with no further descent | **Structural, not undertrained** — a genuinely-still-learning loss would show further descent over 2,550 additional steps; this one is flat. Resolves §2.2's "not yet distinguishable" note |
+| | C (if B non-zero) | Re-swept `occupancy_weight` at corrected `overhang_weight` | not applicable | B was zero — see the row below instead |
+| | C (if B non-zero) | Re-swept `consistency_weight` at corrected `overhang_weight` | not applicable | B was zero — see the row below instead |
+| | C (if B non-zero) | Full 5-condition go/no-go, corrected config | not applicable | B was zero — see the row below instead |
+| | C (if B zero) | Occupancy head init bias (air/solid/marginal) | **not yet done** | §2.3 item 1 — next step, out of scope for `docs/remote-training-readiness-plan.md` (see that doc's header) |
+| | C (if B zero) | Gradient magnitude, pre-upsample vs. 2D backbone at matched depth | **not yet done** | §2.3 item 2 |
+| | C (if B zero) | Transition-cell BCE weight, effective magnitude vs. ground-truth transition rate | **not yet done** | §2.3 item 3 |
 | | D | Walk-under screenshot, `imaginator-gate1.mcim` | | `docs/phase4-plan.md` §9's still-blank Gate 1 row |
+| 2026-08-06 | §1.3 follow-up (`docs/phase4.2-plan.md` §1.4) | `CARVE_THRESHOLD` retuned -0.35 → -0.24 (`world_generator.py`), `model/data` regenerated at 400 regions, seed 0. New ground truth's own multi-run rate vs. marginal baseline | +10.14 pts (10.1363% vs. 0.0000%) | **Decision: leave `--baseline-margin` at the 5.0 default, unchanged.** §1.3 flagged the margin because ground truth's own +2.98 pts couldn't clear 5.0 — that was a density problem, not a margin-calibration problem. The retuned generator's ground truth now clears the default margin by more than 2x with no change to the gate itself, so the correct fix was raising density (`docs/phase4.2-plan.md` §1.1), not loosening the bar — resolves §1.3's parked question in favor of "the gate was right; the data was thin." |

@@ -240,38 +240,100 @@ class MacroFieldLoss(nn.Module):
 class OccupancyLoss(nn.Module):
     """
     Weighted Binary Cross-Entropy loss for 3D occupancy prediction.
-    Focuses weight on solid/air transition boundaries in the target band.
+
+    docs/phase4.2-plan.md §1.2/§3.1: every column has a surface transition (solid-to-air at the
+    topmost solid cell), and the old single `transition_weight` weighted every transition in a
+    column identically — so the weight mass overwhelmingly re-emphasised the heightfield the model
+    already got right (measured: 1.733% of mass on overhang-bearing columns, of which only 0.414%
+    was the extra transitions that actually constitute the overhang). This class now separates the
+    topmost ("surface") transition per column from every other ("extra") transition and weights
+    them independently, so the loss can be told to care about overhangs specifically rather than
+    about solid/air boundaries in general. `transition_weight`'s parameter name and default are
+    unchanged so an out-of-date caller reproduces its old (all-transitions-alike) behaviour exactly
+    until it also sets `extra_transition_weight` — see `docs/phase4.2-plan.md` §3's "loss_mass.py
+    is how every acceptance criterion here is judged" for the numbers this default was tuned
+    against.
     """
 
-    def __init__(self, transition_weight: float = 5.0) -> None:
+    def __init__(self, transition_weight: float = 5.0, extra_transition_weight: float = 100.0) -> None:
         super().__init__()
         self.transition_weight = transition_weight
+        self.extra_transition_weight = extra_transition_weight
+
+    @staticmethod
+    def transition_masks(target_band: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Splits the target band's y-transitions into `(is_surface, is_extra)` boolean masks.
+
+        Exposed as its own method — rather than inlined only in `compute_weight` — so
+        `loss_mass.py` can report the extra-transition mass share using this exact logic instead of
+        a second, hand-reimplemented copy that could silently drift from it (the same reasoning
+        `diagnose_overhangs.py`'s module docstring gives for having one set of metric functions).
+        """
+        target = target_band.float()
+        # Transition mask along y-axis (dim 1): dy[:, i] = 1 iff band index i and i+1 disagree.
+        dy = torch.zeros_like(target)
+        dy[:, :-1, :, :] = torch.abs(target[:, 1:, :, :] - target[:, :-1, :, :])
+        is_transition = dy > 0.5
+
+        # The SURFACE transition is the topmost one per column — world_generator.py's band
+        # invariant guarantees the topmost solid cell (hence its solid->air transition just above
+        # it) exists in every column, so `amax` over the transition indices finds it directly rather
+        # than needing a separate heightfield lookup.
+        idx = torch.arange(target.shape[1], device=target.device, dtype=torch.float32)
+        idx = idx.view(1, -1, 1, 1).expand_as(target)
+        masked_idx = torch.where(is_transition, idx, torch.full_like(idx, -1.0))
+        surface_i = masked_idx.amax(dim=1, keepdim=True)
+        is_surface = is_transition & (idx == surface_i)
+        is_extra = is_transition & ~is_surface
+        return is_surface, is_extra
+
+    def compute_weight(self, target_band: torch.Tensor) -> torch.Tensor:
+        """The per-cell BCE weight mask, computed from the TARGET only (never the prediction) —
+        exposed as its own method, rather than inlined in `forward`, so `loss_mass.py` can report
+        the real weight mass the training loop actually uses instead of a second, hand-reimplemented
+        copy of this math that could silently drift from it.
+        """
+        is_surface, is_extra = self.transition_masks(target_band)
+        return (
+            1.0
+            + self.transition_weight * is_surface.float()
+            + self.extra_transition_weight * is_extra.float()
+        )
 
     def forward(self, pred_logits: torch.Tensor, target_band: torch.Tensor) -> torch.Tensor:
         # pred_logits: [B, 64, 16, 16], target_band: [B, 64, 16, 16] (0.0 or 1.0)
         target = target_band.float()
-        # Compute transition mask along y-axis (dim 1)
-        dy = torch.zeros_like(target)
-        dy[:, :-1, :, :] = torch.abs(target[:, 1:, :, :] - target[:, :-1, :, :])
-        weight = 1.0 + self.transition_weight * dy
+        weight = self.compute_weight(target_band)
         return F.binary_cross_entropy_with_logits(pred_logits, target, weight=weight)
 
 
 class OverhangLoss(nn.Module):
     """
-    Differentiable MSE matching predicted per-chunk overhang cell count against target.
+    Per-cell Binary Cross-Entropy between the predicted and target overhang-indicator fields.
     Calculates overhang cells as air cells with solid material above them in the band.
+
+    docs/phase4.2-plan.md §1.2/§3.2: the previous version matched only a per-chunk SCALAR count
+    (`p_overhang.sum() / 256` via MSE) across 16,384 cells, so it could express *how many* overhang
+    cells a chunk should have and never *where* — its gradient was smeared uniformly over the whole
+    chunk regardless of the target's actual shape. That is why sweeping its weight from 0.0003 to
+    0.03 across 14 checkpoints changed nothing: the term was never the binding constraint. This
+    version keeps `p_overhang`/`target_overhang` — the per-cell overhang-probability and
+    overhang-indicator fields, and the cummax/flip construction that produces them — EXACTLY as
+    they were (docs/phase4.2-plan.md §3.2: "correct and differentiable", not to be redesigned) and
+    changes only what they are compared with: a per-cell BCE instead of an MSE on their sums, which
+    is what actually gives the term a spatially-varying gradient. Count-matching alone no longer
+    drives this term toward zero — `tests/test_model.py`'s
+    `test_overhang_loss_penalizes_misplaced_overhang_at_matched_count` pins that directly.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.mse = nn.MSELoss()
+    _EPS = 1e-6
 
     def forward(self, pred_logits: torch.Tensor, target_band: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(pred_logits)  # [B, 64, 16, 16]
         target = target_band.float()
 
-        # Differentiable cumulative max along y (from top y=63 down to y=0)
+        # Differentiable cumulative max along y (from top y=63 down to y=0) — UNCHANGED, per
+        # docs/phase4.2-plan.md §3.2's instruction to keep this construction as-is.
         flipped_probs = torch.flip(probs, dims=[1])
         cummax_probs, _ = torch.cummax(flipped_probs, dim=1)
         solid_above = torch.flip(cummax_probs, dims=[1])
@@ -281,18 +343,20 @@ class OverhangLoss(nn.Module):
 
         # Overhang probability per cell: air * solid_above
         p_overhang = (1.0 - probs) * solid_above_shifted
-        pred_overhang_count = p_overhang.sum(dim=(1, 2, 3)) / (16.0 * 16.0)
 
-        # Target overhang count
+        # Target overhang indicator per cell — same construction, on the target band.
         target_flipped = torch.flip(target, dims=[1])
         target_cummax, _ = torch.cummax(target_flipped, dim=1)
         target_solid_above = torch.flip(target_cummax, dims=[1])
         target_solid_above_shifted = torch.zeros_like(target_solid_above)
         target_solid_above_shifted[:, :-1, :, :] = target_solid_above[:, 1:, :, :]
         target_overhang = (1.0 - target) * target_solid_above_shifted
-        target_overhang_count = target_overhang.sum(dim=(1, 2, 3)) / (16.0 * 16.0)
 
-        return self.mse(pred_overhang_count, target_overhang_count)
+        # PER-CELL BCE, not MSE-of-sums: this is the entire change. Both operands are already
+        # probabilities in [0, 1] (products of sigmoid outputs / binary indicators), so
+        # `binary_cross_entropy` (not `_with_logits`) is the right primitive; clamped away from the
+        # exact endpoints only to keep `log` finite.
+        return F.binary_cross_entropy(p_overhang.clamp(self._EPS, 1.0 - self._EPS), target_overhang)
 
 
 class ConsistencyLoss(nn.Module):

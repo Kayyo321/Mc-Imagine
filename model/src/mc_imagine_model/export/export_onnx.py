@@ -201,11 +201,32 @@ class ChunkExportWrapper(nn.Module):
         return heightmap_out, block_volume_out, biome_volume_out
 
 
+# The only key prefix `load_imagine_net` is allowed to find missing/unexpected. `text_encoder.*`
+# is expected to be absent from a checkpoint written under C2 (docs/remote-training-readiness-
+# plan.md §2.C2): ImagineNet.__init__ already reloaded the frozen MiniLM encoder from
+# model/checkpoints/ (raising if that failed — §2.E2), so the checkpoint doesn't need to carry a
+# second copy of it. Nothing else may be missing or unexpected — that would silently export an
+# untrained or randomly-initialized piece of the model (§2.J1). Widening this allowlist is an
+# architecture-change decision, not a routine one; do not do it just to make strict=False quiet.
+_ALLOWED_MISSING_UNEXPECTED_PREFIXES = ("text_encoder.",)
+
+
 def load_imagine_net(checkpoint_path: str) -> ImagineNet:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]["model"]
     net = ImagineNet(config)
-    net.load_state_dict(ckpt["model_state_dict"], strict=False)
+    missing, unexpected = net.load_state_dict(ckpt["model_state_dict"], strict=False)
+    missing = [k for k in missing if not k.startswith(_ALLOWED_MISSING_UNEXPECTED_PREFIXES)]
+    unexpected = [k for k in unexpected if not k.startswith(_ALLOWED_MISSING_UNEXPECTED_PREFIXES)]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path!r} does not match ImagineNet's current architecture — "
+            f"missing={missing}, unexpected={unexpected}. Exporting anyway would silently ship an "
+            f"untrained or randomly-initialized piece of the model (docs/remote-training-"
+            f"readiness-plan.md §2.J1). If this checkpoint predates an intentional architecture "
+            f"change, regenerate it or update _ALLOWED_MISSING_UNEXPECTED_PREFIXES deliberately — "
+            f"do not silence this by reverting to strict=False without inspection."
+        )
     net.eval()
     return net
 

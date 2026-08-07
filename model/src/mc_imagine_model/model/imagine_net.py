@@ -113,7 +113,10 @@ class ImagineNet(nn.Module):
             )
 
         checkpoint_dir = config.get("checkpoint_dir")
-        self.text_encoder = PromptEncoder(checkpoint_dir=checkpoint_dir)
+        self.text_encoder = PromptEncoder(
+            checkpoint_dir=checkpoint_dir,
+            allow_random=bool(config.get("allow_random_text_encoder", False)),
+        )
         self.coord_encoder = CoordinateEncoder(halo=halo, patch=patch)
         self.seed_encoder = SeedEncoder(
             num_freqs=config.get("seed_freqs", SEED_FREQS),

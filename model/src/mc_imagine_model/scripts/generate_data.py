@@ -68,7 +68,7 @@ def _report_progress(out_dir: str, target: int, future: concurrent.futures.Futur
 
 
 def generate(num_regions: int, out_dir: str, seed: int, region_layout_width: int,
-             force: bool, quiet: bool) -> int:
+             force: bool, quiet: bool, workers: int = 1) -> int:
     os.makedirs(out_dir, exist_ok=True)
 
     pre_existing = existing_shards(out_dir)
@@ -89,11 +89,12 @@ def generate(num_regions: int, out_dir: str, seed: int, region_layout_width: int
     print(f"  out                 : {os.path.abspath(out_dir)}")
     print(f"  seed                : {seed}")
     print(f"  region_layout_width : {region_layout_width}")
+    print(f"  workers             : {workers}")
 
     source = ProceduralWorldSource(seed=seed)
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(source.generate_shards, num_regions, out_dir, region_layout_width)
+        future = pool.submit(source.generate_shards, num_regions, out_dir, region_layout_width, workers)
         if not quiet:
             _report_progress(out_dir, num_regions, future)
         paths = future.result()  # re-raises anything the generator threw
@@ -131,12 +132,18 @@ def main() -> None:
     parser.add_argument("--force", action="store_true",
                         help="Delete existing region_*.npz in --out before generating")
     parser.add_argument("--quiet", action="store_true", help="Suppress the progress line")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Regions rendered in parallel via ProcessPoolExecutor, one region per "
+                             "task (docs/phase4.2-plan.md §2.1). Default 1 (sequential); shards are "
+                             "byte-identical regardless of worker count.")
     args = parser.parse_args()
 
     if args.regions <= 0:
         parser.error("--regions must be positive")
     if args.region_layout_width <= 0:
         parser.error("--region-layout-width must be positive")
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
 
     out_dir = args.out
     if out_dir is None:
@@ -145,7 +152,7 @@ def main() -> None:
         out_dir = os.path.join(model_root, "data")
 
     sys.exit(generate(args.regions, out_dir, args.seed, args.region_layout_width,
-                      args.force, args.quiet))
+                      args.force, args.quiet, args.workers))
 
 
 if __name__ == "__main__":

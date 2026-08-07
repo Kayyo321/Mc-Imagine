@@ -118,15 +118,21 @@ class McImagineDataset(Dataset):
         if cached is not None:
             self._shard_cache.move_to_end(path)
             return cached
+        # These four checks are `raise`s, not `assert`s, deliberately: some container images set
+        # PYTHONOPTIMIZE=1 / run python -O, which strips assert statements, and these are the
+        # guards that make "mixing shard generations silently trains a confused model" impossible
+        # (docs/remote-training-readiness-plan.md §2.E3).
         with np.load(path) as npz:
-            assert "band" in npz, (
-                path
-                + ": missing 'band' array — stale shard (v1.1.x heightfield format), regenerate with ProceduralWorldSource.generate_shards to include the 64-block occupancy band"
-            )
+            if "band" not in npz:
+                raise ValueError(
+                    path
+                    + ": missing 'band' array — stale shard (v1.1.x heightfield format), regenerate with ProceduralWorldSource.generate_shards to include the 64-block occupancy band"
+                )
             band = npz["band"]
-            assert band.shape == (CANVAS, CANVAS, 64), (
-                path + ": band shape mismatch — stale or corrupted band array"
-            )
+            if band.shape != (CANVAS, CANVAS, 64):
+                raise ValueError(
+                    path + ": band shape mismatch — stale or corrupted band array"
+                )
             data = {
                 "heightfield": npz["heightfield"],
                 "band": band,
@@ -140,15 +146,17 @@ class McImagineDataset(Dataset):
         # failure mode docs/phase2-plan.md §1b wants to make impossible. Heights are legitimately
         # negative now, so this is a two-sided bound, not a floor at 0.
         biome_max = int(data["biome_map"].max())
-        assert biome_max < NUM_BIOMES, (
-            f"{path}: biome id {biome_max} >= NUM_BIOMES ({NUM_BIOMES}) — stale shard, regenerate "
-            f"with ProceduralWorldSource.generate_shards"
-        )
+        if not (biome_max < NUM_BIOMES):
+            raise ValueError(
+                f"{path}: biome id {biome_max} >= NUM_BIOMES ({NUM_BIOMES}) — stale shard, regenerate "
+                f"with ProceduralWorldSource.generate_shards"
+            )
         h_min, h_max = float(data["heightfield"].min()), float(data["heightfield"].max())
-        assert HEIGHT_MIN < h_min and h_max < HEIGHT_MAX, (
-            f"{path}: heights [{h_min:.1f}, {h_max:.1f}] fall outside the head's representable band "
-            f"({HEIGHT_MIN}, {HEIGHT_MAX}) — TerrainHead's tanh would saturate on these targets"
-        )
+        if not (HEIGHT_MIN < h_min and h_max < HEIGHT_MAX):
+            raise ValueError(
+                f"{path}: heights [{h_min:.1f}, {h_max:.1f}] fall outside the head's representable band "
+                f"({HEIGHT_MIN}, {HEIGHT_MAX}) — TerrainHead's tanh would saturate on these targets"
+            )
         self._shard_cache[path] = data
         if len(self._shard_cache) > self._shard_cache_size:
             self._shard_cache.popitem(last=False)
@@ -220,7 +228,10 @@ class McImagineDataset(Dataset):
             "seed": torch.tensor(int(params["seed"]), dtype=torch.int64),
             "capability_tier": "none",
             "heightmap": torch.from_numpy(height_core.copy()).to(torch.float32),
-            "occupancy_band": torch.from_numpy(band_transposed.copy()).to(torch.float32),
+            # uint8, not float32: band_transposed is bool on disk, and OccupancyLoss/OverhangLoss
+            # already do their own .float() cast on-GPU. float32 made this field 95% of every
+            # batch's bytes (docs/remote-training-readiness-plan.md §2.B2) for no reason.
+            "occupancy_band": torch.from_numpy(band_transposed.copy()).to(torch.uint8),
             "profile_id": torch.from_numpy(profile_core.copy().astype(np.int64)),
             "water_level": torch.tensor(water_level, dtype=torch.float32),
             "block_volume": torch.zeros(0),  # see class docstring — full volume is emitted at export time

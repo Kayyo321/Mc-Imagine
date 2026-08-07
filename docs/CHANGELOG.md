@@ -205,6 +205,40 @@ All notable changes to the Mc-Imagine model, training pipeline, export scripts, 
   to be reachable in practice despite the docstring's argument that it shouldn't be) and needs a
   design change rather than more steps.
 
+- **Phase 4.1 §2.2 — the confirmatory run (2026-08-05)**: one longer run at the corrected
+  `overhang_weight: 0.005`, 400 regions / 3,000 steps (`config.mps.yaml`, MPS, `consistency_weight`
+  also now 0.0 per `docs/remote-training-readiness-plan.md` §2.H1/§5 item 0.2 — see below),
+  evaluated with `scripts/diagnose_overhangs.py --checkpoint training_runs/mps_run1/last.pt
+  --ground-truth model/data`.
+
+  **Result: multi-run columns are still exactly 0.0000% at 3,000 steps** (7.5x the original 400-step
+  Gate 2 sweep length, and 2,500 steps past `warmup_steps: 200`). Zero overhang cells, zero
+  cavities, zero walkable voids — an identical floor to every one of the 14 original sweep
+  checkpoints. Full 5-condition gate: `1. multi-run margin +0.0000 pts (need >=5.00) NOT MET`,
+  `2. walkable-void retention 0.00% NOT MET`, `3. mean floor area retention 0.00% NOT MET`,
+  `4. p90 cavity height 0 blocks (need >=3) NOT MET`. VERDICT: FAIL.
+
+  **The occupancy loss curve is a plateau, not a slow descent.** It falls 0.7215 (step 0) -> ~0.025
+  by step ~450 (still inside epoch 0), then holds in the 0.016-0.05 band for the remaining ~2,550
+  steps with no further improvement — sampled at steps 450, 925, 1,675, 2,325, 2,675, 3,150: 0.0246,
+  0.0159, 0.0235, 0.0258, 0.0320, 0.0242. This settles the question `docs/phase4.1-plan.md` §2.2
+  posed as still-open after the original 400-step run ("some evidence for undertrained, not yet
+  distinguishable from the data on hand"): 3,000 steps is long enough that a genuinely-still-learning
+  loss would show *some* further descent, and this one does not. Per §2.2's own decision point —
+  *"if multi-run columns are still exactly 0.0000% at this length, treat that as a real negative
+  result, not a 'needs more steps' excuse to keep extending"* — **this is Step C's zero-result
+  branch**: proceed to §2.3's structural diagnosis list (occupancy head init bias; gradient flow
+  through the y-upsample; cell-level transition-weighting magnitude; capacity, only after the first
+  three) before any further training spend. Not executed here — §2.3 is a separate diagnosis task
+  with its own scope, and `docs/remote-training-readiness-plan.md` explicitly does not own
+  relitigating Phase 4.1 (see that document's header). **Gate 2 has no verdict yet and Gate 3 remains
+  correctly not started** — this result does not change that, it just closes off "the confirmatory
+  run hasn't been tried" as an open question.
+
+  Checkpoint: `model/training_runs/mps_run1/last.pt` (123.4 MB, matches the measured checkpoint size
+  elsewhere in this log). Full diagnostic JSON and training log kept alongside this run for §2.3's
+  future diagnosis pass.
+
 ## [v1.1.1] - Phase 3.1 prep (2026-07-30)
 
 Gate 1 groundwork for the v1.1.1 release (`docs/phase3.1-plan.md`), done on the dev machine ahead

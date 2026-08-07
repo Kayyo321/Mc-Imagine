@@ -2,6 +2,7 @@
 Basic pytest tests for the Mc-Imagine model components.
 """
 
+import os
 import random
 from typing import Dict
 
@@ -570,29 +571,30 @@ def test_terrain_loss_penalizes_flat_prediction() -> None:
 
 
 def test_overhang_loss_uniform_prediction_is_stationary_point() -> None:
-    """`OverhangLoss` (training/losses.py) is `ReliefLoss`'s volumetric sibling
-    (docs/phase4-plan.md §3.2), matching per-chunk overhang-cell *count* rather than location for
-    exactly the same reason `ReliefLoss` matches magnitude rather than pointwise value. §3.2 says it
-    "Inherits `ReliefLoss`'s known stationary point at a bit-exactly uniform prediction ... Pin it
-    in `test_model.py` the way `ReliefLoss`'s is pinned, and if the band ever comes out uniform,
-    check this first before re-deriving it." This test is that pin.
+    """`OverhangLoss` (training/losses.py) computes a per-cell overhang PROBABILITY field
+    (`p_overhang = (1-p) * solid_above`, via the cummax/flip construction docs/phase4.2-plan.md
+    §3.2 requires be kept exactly as-is) and now compares it against the target with a per-cell BCE
+    instead of the old count-MSE — but the stationary point this test pins is a property of that
+    SHARED construction, not of the top-level reduction, so it survived the §3.2 rewrite unchanged.
 
     A bit-exactly uniform occupancy prediction has exactly one true degree of freedom: the shared
-    logit `c` (equivalently the marginal solid probability `p = sigmoid(c)`), because every one of
-    the `64*16*16` cells carries the same value — a real conv stack collapsing to this degenerate
-    output can only move every cell together, so `c` is the physically meaningful direction to
-    differentiate along (independently perturbing individual cells is not a direction a uniform
-    prediction can actually move in). Per-cell overhang probability is `(1-p) * p` (air times
-    "solid above"), which is maximized at `p=0.5` (`c=0`): `d/dp[(1-p)p] = 1-2p = 0` at `p=0.5`.
-    So `c=0` is a local MAXIMUM of the predicted overhang count as a function of the network's one
-    remaining degree of freedom, and — same as `ReliefLoss`'s std-based term — the loss's gradient
-    there is zero *regardless of the target*, because it factors through `d(count)/dc = 0`.
+    logit `c` (`p = sigmoid(c)`), since every one of the `64*16*16` cells carries the same value. At
+    a uniform `p`, `torch.cummax`'s tie-breaking backward (ties resolve to the earliest maximal
+    element in scan order — see the note below) routes EVERY cell's gradient through the same single
+    source cell, so `solid_above_shifted`'s derivative w.r.t. `c` is `p(1-p)` at every cell, same as
+    `p` itself. That makes `d(p_overhang)/dc = p(1-p)(1-2p)` — IDENTICAL across every cell, not just
+    in aggregate — which is exactly zero at `p=0.5` (`c=0`) and changes sign either side of it. Since
+    every cell's `p_overhang` moves by the same scalar factor, `d(loss)/dc` factors as that scalar
+    times a sum over cells, so it is zero at `c=0` regardless of what per-cell loss or target is
+    used — this is why the property transferred from the old count-MSE loss to the new per-cell BCE
+    without needing to be re-derived from scratch.
 
     Verified empirically before writing this test (not merely by the algebra above, since
-    `OverhangLoss` routes gradient through `torch.cummax`, whose backward at exact ties is a hard,
-    tie-breaking selection rather than the smooth analytic derivative — the two need not agree, but
-    here they do): at `c=0` the gradient is exactly `0.0` against an arbitrary random target, while
-    `c=0.37` and `c=-1.2` both produce large nonzero gradients of the expected opposite signs.
+    `torch.cummax`'s backward at exact ties is a hard, tie-breaking selection rather than the smooth
+    analytic derivative — the two need not agree, but here they do): at `c=0` the gradient is `~0`
+    (`-2e-10`, floating-point noise from the BCE `clamp`/`log`, not `0.0` bit-exactly the way the old
+    MSE-of-count version was — BCE has no exact-zero guarantee the old polynomial arithmetic had),
+    while `c=+-1e-2` both produce real nonzero gradients of the expected opposite signs.
 
     Like `ReliefLoss`'s stationary point, this is measure-zero and benign: a real conv stack never
     emits a bit-exactly uniform prediction across every band cell (see `ReliefLoss`'s docstring for
@@ -610,28 +612,29 @@ def test_overhang_loss_uniform_prediction_is_stationary_point() -> None:
     logits = c.expand(B, 64, 16, 16)
     loss = overhang(logits, target)
     loss.backward()
-    assert c.grad is not None and c.grad.item() == 0.0, (
+    assert c.grad is not None and abs(c.grad.item()) < 1e-6, (
         "a bit-exactly uniform occupancy prediction (p=0.5 everywhere) is expected to be a "
-        "stationary point of OverhangLoss, inherited from ReliefLoss's argument "
-        "(docs/phase4-plan.md §3.2); if this now has gradient, the term changed shape and both "
-        "this test and §3.2's note need updating"
+        "(near-)stationary point of OverhangLoss's shared cummax/flip construction "
+        "(docs/phase4.2-plan.md §3.2); if the gradient is no longer tiny here, the construction "
+        "changed shape and both this test and §3.2's note need updating"
     )
 
-    # It is a genuine LOCAL MAXIMUM of the predicted count, not an accident of this target: probe
-    # the real forward path (not a reimplementation) with an all-zero target, whose overhang count
-    # is exactly 0, so `loss == pred_count**2` and `sqrt(loss)` recovers `pred_count` (>= 0 always,
-    # being a product of two probabilities) directly from the production code.
+    # It is a genuine LOCAL MAXIMUM, not an accident of this target: probe the real forward path
+    # (not a reimplementation) with an all-zero target. BCE against an all-zero target reduces to
+    # `-log(1 - p_overhang)`, which is monotonically INCREASING in `p_overhang` — so since
+    # `p_overhang` itself peaks at `p=0.5` (the algebra above), the loss against a zero target peaks
+    # there too, and a HIGHER loss at `c=0` than at neighboring points is the local-maximum witness.
     target_zero = torch.zeros(1, 64, 16, 16)
 
-    def real_pred_count(logit_value: float) -> float:
+    def real_loss_at(logit_value: float) -> float:
         logits_ = torch.full((1, 64, 16, 16), logit_value)
-        return overhang(logits_, target_zero).sqrt().item()
+        return overhang(logits_, target_zero).item()
 
-    at_half = real_pred_count(0.0)
-    assert real_pred_count(-0.5) < at_half and real_pred_count(0.5) < at_half, (
-        "p=0.5 must be a local maximum of the predicted overhang count; if it is not, the "
-        "stationary point above is a saddle, not the benign maximum docs/phase4-plan.md §3.2 "
-        "describes as inherited from ReliefLoss"
+    at_half = real_loss_at(0.0)
+    assert real_loss_at(-0.5) < at_half and real_loss_at(0.5) < at_half, (
+        "p=0.5 must be a local MAXIMUM of the against-zero-target loss (since that loss is "
+        "monotonic in p_overhang, which itself peaks at p=0.5); if it is not, the stationary point "
+        "above is a saddle or minimum, not the benign maximum this test expects"
     )
 
     # And moving off the exact stationary point restores a real, nonzero gradient.
@@ -640,6 +643,46 @@ def test_overhang_loss_uniform_prediction_is_stationary_point() -> None:
     assert c2.grad is not None and c2.grad.item() != 0.0, (
         "a near-uniform prediction should already have a real gradient; the stationary point must "
         "be an isolated, measure-zero point, not a plateau"
+    )
+
+
+def test_overhang_loss_penalizes_misplaced_overhang_at_matched_count() -> None:
+    """docs/phase4.2-plan.md §3.2's Done-when: "Count-matching alone must no longer be satisfiable."
+
+    Two predictions with the exact same TOTAL predicted overhang cell count — one placing them
+    where the target's overhang actually is, one placing the same number of cells somewhere the
+    target has none — must no longer score the same loss. The old per-chunk count-MSE literally
+    could not tell these apart (that was §1.2's diagnosis: "it can express *how many* overhang
+    cells a chunk should have and never *where*"); the new per-cell BCE must.
+    """
+    overhang = OverhangLoss()
+    B, Y, Z, X = 1, 64, 4, 4
+
+    # Target: a single overhang cell, produced the same way the loss itself derives one — one solid
+    # cell with air directly below it, elsewhere all solid (so the topmost band index has nothing
+    # above it and is never itself counted as an overhang).
+    target = torch.ones(B, Y, Z, X)
+    target[0, 10, 1, 1] = 0.0  # the one air cell; target[0, 11, 1, 1] stays solid above it
+
+    def logits_with_air_at(y: int, z: int, x: int) -> torch.Tensor:
+        # Large-magnitude logits so probs are close to bit-exact 0/1, matching the target's own
+        # binary structure as closely as floating point allows.
+        base = torch.full((B, Y, Z, X), 8.0)
+        base[0, y, z, x] = -8.0
+        return base
+
+    loss_matched = overhang(logits_with_air_at(10, 1, 1), target).item()
+    loss_misplaced = overhang(logits_with_air_at(20, 2, 2), target).item()
+
+    assert loss_matched < 1e-3, (
+        f"predicting the overhang at its actual location should drive the loss near zero, got "
+        f"{loss_matched:.6f}"
+    )
+    assert loss_misplaced > 10 * max(loss_matched, 1e-6), (
+        f"a same-COUNT (one cell), different-LOCATION prediction should score substantially worse "
+        f"than the matched-location prediction (matched={loss_matched:.6f}, "
+        f"misplaced={loss_misplaced:.6f}) — if it does not, count-matching is still enough to "
+        f"satisfy this term and §3.2's fix did not localise it"
     )
 
 
@@ -1182,7 +1225,12 @@ def test_configs_declare_relief_weight() -> None:
     relief_weight, occupancy_weight, overhang_weight, and consistency_weight under training using PyYAML.
 
     The code defaults the Phase 4 weights to 0.0 for backwards compatibility, but shipped configs
-    must not use that value or the occupancy head reaches the training box unsupervised.
+    must not use that value or the occupancy head reaches the training box unsupervised — except
+    consistency_weight, which is deliberately pinned to 0.0 in all three configs
+    (docs/remote-training-readiness-plan.md §2.H1/§5 item 0.2): ConsistencyLoss's residual is
+    minimized by pushing soft_topmost toward the top of the band regardless of data, a live
+    candidate contributor to Gate 2's uniform failure. That decision is locked; do not revert it
+    here without revisiting §2.H1 first.
     """
     import os
     import yaml
@@ -1192,20 +1240,27 @@ def test_configs_declare_relief_weight() -> None:
     config_dir = os.path.join(model_dir, "src", "mc_imagine_model", "training")
 
     configs = ["config.cuda.yaml", "config.mps.yaml", "config.rehearsal.yaml"]
-    expected_weights = ["relief_weight", "occupancy_weight", "overhang_weight", "consistency_weight"]
+    expected_positive_weights = ["relief_weight", "occupancy_weight", "overhang_weight"]
     for config_name in configs:
         path = os.path.join(config_dir, config_name)
         assert os.path.isfile(path), f"Config file not found: {path}"
         with open(path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         assert "training" in cfg, f"Missing 'training' section in {config_name}"
-        for w_name in expected_weights:
+        for w_name in expected_positive_weights:
             assert w_name in cfg["training"], (
                 f"Missing '{w_name}' under 'training' in {config_name}"
             )
             assert float(cfg["training"][w_name]) > 0.0, (
                 f"{config_name} sets {w_name}=0.0; shipped configs must train every Phase 4 loss"
             )
+        assert "consistency_weight" in cfg["training"], (
+            f"Missing 'consistency_weight' under 'training' in {config_name}"
+        )
+        assert float(cfg["training"]["consistency_weight"]) == 0.0, (
+            f"{config_name} sets consistency_weight != 0.0; this is locked at 0.0 per "
+            "docs/remote-training-readiness-plan.md §2.H1 — see this test's docstring."
+        )
 
 
 def test_imagine_net_forward_backward_dry_run() -> None:
@@ -1266,3 +1321,121 @@ def test_imagine_net_forward_backward_dry_run() -> None:
     for name, param in model.named_parameters():
         if param.requires_grad:
             assert param.grad is not None, f"Parameter {name} has no gradient for {name}"
+
+
+def _corrupt_shard(src_path: str, dst_path: str, **overrides) -> None:
+    """Writes a copy of a real shard with some arrays replaced/removed, for stale-shard tests."""
+    import numpy as np
+
+    with np.load(src_path) as npz:
+        arrays = {k: npz[k] for k in npz.files}
+    for key, value in overrides.items():
+        if value is _MISSING:
+            arrays.pop(key, None)
+        else:
+            arrays[key] = value
+    np.savez_compressed(dst_path, **arrays)
+
+
+_MISSING = object()
+
+
+def test_load_shard_raises_not_asserts_on_stale_or_corrupt_data(tmp_path) -> None:
+    """docs/remote-training-readiness-plan.md §2.E3 / §5 item 0.5.
+
+    `McImagineDataset._load_shard`'s four stale-shard guards were `assert` statements, which
+    `python -O`/`PYTHONOPTIMIZE=1` strips — some container images set that. This pins them as
+    `raise`s that survive `-O`, by actually running this test under `-O` (see the `-O` invocation
+    this docstring's item requires) against four kinds of deliberately corrupted shard.
+    """
+    import numpy as np
+    from mc_imagine_model.data.dataset import McImagineDataset
+    from mc_imagine_model.data.world_generator import CANVAS, ProceduralWorldSource
+    from mc_imagine_model.spec_constants import HEIGHT_MAX, NUM_BIOMES
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    [real_path] = ProceduralWorldSource(seed=0).generate_shards(1, str(real_dir), region_layout_width=64)
+
+    cases = {
+        "missing_band": dict(band=_MISSING),
+        "bad_band_shape": dict(band=np.zeros((CANVAS, CANVAS, 8), dtype=bool)),
+        "biome_out_of_range": dict(biome_map=np.full((CANVAS, CANVAS), NUM_BIOMES, dtype=np.uint8)),
+        "height_out_of_range": dict(
+            heightfield=np.full((CANVAS, CANVAS), HEIGHT_MAX + 100.0, dtype=np.float32)
+        ),
+    }
+    for name, overrides in cases.items():
+        bad_path = tmp_path / f"region_{name}.npz"
+        _corrupt_shard(real_path, str(bad_path), **overrides)
+        ds = McImagineDataset(str(tmp_path), shard_paths=[str(bad_path)],
+                              chunks_per_region=1, shard_cache_size=1)
+        with pytest.raises(ValueError):
+            ds[0]
+
+
+def _tiny_model_optimizer_scheduler():
+    model = ImagineNet(SMALL_CONFIG)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0)
+    return model, optimizer, scheduler
+
+
+def test_export_raises_on_missing_state_dict_keys(tmp_path) -> None:
+    """docs/remote-training-readiness-plan.md §2.J1 / §5 item 1.2, core case: a checkpoint that is
+    missing real (non-text-encoder) weights — e.g. written before an architecture change added a
+    head — must raise on export, not silently ship a randomly-initialized piece of the model under
+    strict=False.
+    """
+    from mc_imagine_model.export.export_onnx import load_imagine_net
+    from mc_imagine_model.training.train import save_checkpoint
+
+    model, optimizer, scheduler = _tiny_model_optimizer_scheduler()
+    config = {"model": dict(SMALL_CONFIG)}
+    ckpt_path = os.path.join(str(tmp_path), "stale.pt")
+    save_checkpoint(ckpt_path, model, optimizer, scheduler, None, config,
+                    epoch=0, global_step=1, val_loss=1.0, best_val_loss=1.0)
+
+    # Simulate a stale/incompatible checkpoint by dropping real (non-text-encoder) keys after the
+    # fact — the shape of bug this check exists to catch: a checkpoint saved before an architecture
+    # change (e.g. missing occupancy_head.*) still needs to fail loudly on export.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    dropped = [k for k in ckpt["model_state_dict"] if k.startswith("occupancy_head.")]
+    assert dropped, "expected SMALL_CONFIG's ImagineNet to have an occupancy_head"
+    for k in dropped:
+        del ckpt["model_state_dict"][k]
+    torch.save(ckpt, ckpt_path)
+
+    with pytest.raises(RuntimeError, match="missing="):
+        load_imagine_net(ckpt_path)
+
+
+def test_export_raises_when_checkpoint_dir_missing_for_c2_format_checkpoint(tmp_path) -> None:
+    """docs/remote-training-readiness-plan.md §2.J2 / §5 item 1.2 — the literal negative test the
+    plan requires. C2 (frozen text encoder dropped from checkpoints, `train.save_checkpoint`) is
+    only safe because J1 (export raises on unexpected missing keys) and E2 (`PromptEncoder`'s
+    random fallback is fatal by default, item 0.6) are both already in place. If
+    `model/checkpoints/` is unreachable at export time, this composition must fail loudly — not
+    silently package a `.mcim` whose text encoder is random noise.
+    """
+    from mc_imagine_model.export.export_onnx import load_imagine_net
+    from mc_imagine_model.training.train import save_checkpoint
+
+    model, optimizer, scheduler = _tiny_model_optimizer_scheduler()
+    # This checkpoint's own model_state_dict already omits text_encoder.* (save_checkpoint's C2
+    # behavior) — the point under test is what happens when export tries to reconstruct the model
+    # and the checkpoint's *own* config points at a checkpoint_dir that no longer exists.
+    config = {"model": dict(SMALL_CONFIG)}
+    config["model"]["checkpoint_dir"] = str(tmp_path / "definitely_missing_minilm_checkpoint")
+    ckpt_path = os.path.join(str(tmp_path), "last.pt")
+    save_checkpoint(ckpt_path, model, optimizer, scheduler, None, config,
+                    epoch=0, global_step=1, val_loss=1.0, best_val_loss=1.0)
+
+    saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert not any(k.startswith("text_encoder.") for k in saved["model_state_dict"]), (
+        "test setup assumption broken: save_checkpoint should already exclude text_encoder.*"
+    )
+
+    with pytest.raises(RuntimeError):
+        load_imagine_net(ckpt_path)
