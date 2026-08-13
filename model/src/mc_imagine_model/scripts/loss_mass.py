@@ -27,7 +27,7 @@ import os
 import numpy as np
 import torch
 
-from mc_imagine_model.training.losses import OccupancyLoss, OverhangLoss
+from mc_imagine_model.training.losses import OccupancyLoss, OverhangLoss, VerticalCoherenceLoss
 
 # Same layout as preflight.py: .../mc_imagine_model/scripts/loss_mass.py -> .../model
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../mc_imagine_model
@@ -55,6 +55,32 @@ def load_chunks(data_dir: str, num_regions: int, num_chunks: int) -> torch.Tenso
     if not chunks:
         raise RuntimeError(f"loaded {len(paths)} shards from {data_dir} but extracted zero chunks")
     return torch.from_numpy(np.stack(chunks[:num_chunks])).float()
+
+
+def build_matched_rate_speckle(band: torch.Tensor, seed: int = 0) -> torch.Tensor:
+    """Heightfield-only, plus one random 1-block cavity per column at `band`'s own multi-run column
+    rate — docs/phase4.3-plan.md §4.2's "speckle at matched multi-run rate", used to give
+    `VerticalCoherenceLoss` a report point where it is actually nonzero (it is exactly zero at a
+    heightfield-only prediction by construction: excess is only ever charged over-target, and
+    heightfield predicts no cavities at all — see `test_objective_ranking.py`'s docstring).
+    """
+    n, h, z, x = band.shape
+    dy = torch.zeros_like(band)
+    dy[:, :-1] = (band[:, 1:] - band[:, :-1]).abs()
+    n_trans = dy.sum(dim=1)
+    multi_run_pct = float((n_trans >= 2).float().mean()) * 100.0
+
+    hf = torch.zeros_like(band)
+    hf[:, :62] = 1.0  # BAND_BOTTOM_OFFSET=-61 -> solid iff i<=61 (spec_constants), matches heightfield_band
+
+    rng = np.random.default_rng(seed)
+    n_cols = n * z * x
+    flat = hf.permute(0, 2, 3, 1).reshape(n_cols, h).clone()
+    n_speckled = int(round(multi_run_pct / 100.0 * n_cols))
+    cols = rng.choice(n_cols, size=min(n_speckled, n_cols), replace=False)
+    carve_i = rng.integers(low=5, high=55, size=cols.size)
+    flat[cols, carve_i] = 0.0
+    return flat.reshape(n, z, x, h).permute(0, 3, 1, 2).contiguous()
 
 
 def report(band: torch.Tensor, overhang_weights) -> None:
@@ -97,6 +123,29 @@ def report(band: torch.Tensor, overhang_weights) -> None:
     for wt in overhang_weights:
         share = ovh * wt / (occ + ovh * wt) * 100
         print(f"    at overhang_weight={wt:<8}: share = {share:6.2f}%")
+
+    # --- VerticalCoherenceLoss (docs/phase4.3-plan.md §4.2, B.2) -----------------------------
+    # Zero at heightfield-only by construction (it only ever charges an EXCESS of predicted
+    # 1-tall cavities over the target's own count, and heightfield predicts none), so its share is
+    # reported at a matched-rate speckle prediction instead — the case it exists to penalize.
+    speckle_logits = torch.logit(build_matched_rate_speckle(band).clamp(1e-4, 1 - 1e-4))
+    occ_speckle = occupancy_loss(speckle_logits, band)
+    ovh_speckle = OverhangLoss()(speckle_logits, band)
+    vert_speckle = VerticalCoherenceLoss()(speckle_logits, band)
+    print(f"\nAt a matched-rate *1-block-speckle* prediction:")
+    print(f"  occupancy term            = {occ_speckle:.6f}   x weight 1.0")
+    print(f"  overhang term             = {ovh_speckle:.6f}   x weight 4.0 (shipped)")
+    print(f"  vertical-coherence term   = {vert_speckle:.6f}   (docs/phase4.3-plan.md §4.2 B.2)")
+    fixed = occ_speckle + 4.0 * ovh_speckle
+    for vw in (0.0, 150.0, 240.0, 300.0, 500.0, 1000.0):
+        share = vert_speckle * vw / (fixed + vert_speckle * vw) * 100
+        print(f"    at vertical_weight={vw:<8}: share = {share:6.2f}%")
+    print(
+        "  Note (operator decision 2026-08-08, tests/test_objective_ranking.py): 300 closes "
+        "`real < displaced < speckle` with headroom over the measured ~240 threshold; the stricter "
+        "\"displaced closer to real than to speckle\" needs ~2826 and is not shipped — see that "
+        "test's module docstring for the full finding."
+    )
 
 
 def main() -> None:

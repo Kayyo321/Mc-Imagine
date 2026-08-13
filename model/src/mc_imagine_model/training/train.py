@@ -879,6 +879,7 @@ def train(config: Dict[str, Any], max_steps: Optional[int] = None, resume: Optio
         occupancy_weight=train_cfg.get("occupancy_weight", 0.0),
         overhang_weight=train_cfg.get("overhang_weight", 0.0),
         consistency_weight=train_cfg.get("consistency_weight", 0.0),
+        vertical_weight=train_cfg.get("vertical_weight", 0.0),
         structure_weight=0.0,
         structure_graph_weight=0.0,
     )

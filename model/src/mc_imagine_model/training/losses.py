@@ -359,6 +359,78 @@ class OverhangLoss(nn.Module):
         return F.binary_cross_entropy(p_overhang.clamp(self._EPS, 1.0 - self._EPS), target_overhang)
 
 
+class VerticalCoherenceLoss(nn.Module):
+    """Penalizes an EXCESS of predicted 1-tall cavities over the target's OWN rate of them
+    (docs/phase4.3-plan.md §4.2, B.2) — the shape term that closes the objective/gate mismatch §2 of
+    that plan diagnoses: per-cell BCE cannot tell "right shape, wrong place" from "no shape at all",
+    so when placement is hard the placement-optimal prediction is the per-cell marginal, which
+    thresholds into exactly the single worst possible SHAPE — isolated 1-block air cells. This term
+    prices that shape in directly, independent of `OccupancyLoss`/`OverhangLoss`'s per-cell BCE.
+
+    THE FIELD. `p_1tall(y) = p_air(y) * p_solid(y-1) * p_solid(y+1)` — the differentiable probability
+    that cell `y` is a maximal, exactly-1-block-tall cavity: air, with solid immediately below AND
+    immediately above. Boundary convention matches `diagnose_overhangs.compute_overhang_metrics`
+    exactly (the module that defines what a "cavity" and a "1-tall" one mean everywhere else in this
+    codebase), so this term's notion of a 1-tall cavity is the same one the gate measures:
+      - below index 0: a known-solid VIRTUAL floor cell participates (`p_solid(-1) = 1.0`), matching
+        "a cavity whose floor is the band floor is a real cavity with a real floor".
+      - above the top index: no cell exists (`p_solid(BAND_HEIGHT) = 0.0`, never solid), so a
+        cavity can never register as 1-tall by touching the open top of the band — matching "an air
+        run that reaches the top of the band is not a cavity".
+
+    WHY EXCESS, NOT THE ABSOLUTE COUNT. Ground truth itself has real 1-block cavities (measured,
+    `phase4.2-plan.md` §1.2: p50 cavity height sits well above 1, but the distribution's own left
+    tail is nonzero) — penalizing `p_1tall`'s absolute sum would forbid them outright and just
+    re-derive the heightfield optimum from the opposite direction (push every column toward EITHER
+    tall-or-nothing, discouraging exactly the isolated voids ground truth legitimately contains).
+    Comparing per-CHUNK predicted count against the target's own per-chunk count and penalizing only
+    `relu(predicted - target)` means a prediction that reproduces ground truth's 1-block-cavity rate
+    exactly costs nothing here — this is `phase4.3-plan.md` §4.2's "Do not... B.1's `real` case is
+    what proves it (real caves must stay near zero loss)" requirement, and `test_objective_ranking.py`
+    checks it directly (a bit-exact real-cave prediction scores near zero even with this term active).
+
+    WHAT IS DELIBERATELY UNCHANGED. `OverhangLoss`'s cummax/flip construction is not touched by this
+    class — `phase4.3-plan.md` §3's 🔒 marks it as settled, and this term uses a completely separate,
+    local (3-cell) product instead of that global suffix-max, so the two constructions cannot drift
+    into each other by accident.
+    """
+
+    @staticmethod
+    def _one_tall_field(solid: torch.Tensor) -> torch.Tensor:
+        """`solid`: `[B, BAND_HEIGHT, Z, X]`, soft (probabilities, 0..1) or hard (0.0/1.0) occupancy,
+        1=solid. Returns the per-cell 1-tall-cavity field, same shape, using the boundary convention
+        documented on the class above.
+        """
+        b, h, z, x = solid.shape
+        floor = torch.ones(b, 1, z, x, device=solid.device, dtype=solid.dtype)
+        sky = torch.zeros(b, 1, z, x, device=solid.device, dtype=solid.dtype)
+        padded = torch.cat([floor, solid, sky], dim=1)  # [B, H+2, Z, X]
+        below = padded[:, 0:h, :, :]
+        above = padded[:, 2:h + 2, :, :]
+        air = 1.0 - solid
+        return air * below * above
+
+    def forward(self, pred_logits: torch.Tensor, target_band: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(pred_logits)  # [B, 64, 16, 16], p_solid
+        target = target_band.float()
+
+        pred_field = self._one_tall_field(probs)
+        target_field = self._one_tall_field(target)
+
+        # Per-CHUNK counts (sum over band + spatial dims), not per-cell: "the target's own rate" is a
+        # property of the whole chunk (how many 1-block cavities it legitimately contains), not of
+        # any individual cell.
+        pred_count = pred_field.sum(dim=(1, 2, 3))
+        target_count = target_field.sum(dim=(1, 2, 3))
+
+        # Normalized by cell count so this term lives on the same O(0-1) scale as
+        # OccupancyLoss/OverhangLoss's per-cell BCE means, rather than O(cells) — keeps
+        # `vertical_weight` a comparably-sized knob to `occupancy_weight`/`overhang_weight`.
+        n_cells = float(pred_field.shape[1] * pred_field.shape[2] * pred_field.shape[3])
+        excess = torch.clamp(pred_count - target_count, min=0.0) / n_cells
+        return excess.mean()
+
+
 class ConsistencyLoss(nn.Module):
     """
     Penalizes gap between predicted heightmap h and the soft-argmax topmost solid cell in the band.
@@ -403,6 +475,7 @@ class CombinedLoss(nn.Module):
         occupancy_weight: float = 0.0,
         overhang_weight: float = 0.0,
         consistency_weight: float = 0.0,
+        vertical_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.terrain_loss = TerrainLoss(slope_weight=slope_weight)
@@ -413,6 +486,7 @@ class CombinedLoss(nn.Module):
         self.occupancy_loss = OccupancyLoss()
         self.overhang_loss = OverhangLoss()
         self.consistency_loss = ConsistencyLoss()
+        self.vertical_loss = VerticalCoherenceLoss()
 
         self.terrain_weight = terrain_weight
         self.biome_weight = biome_weight
@@ -425,6 +499,10 @@ class CombinedLoss(nn.Module):
         self.occupancy_weight = occupancy_weight
         self.overhang_weight = overhang_weight
         self.consistency_weight = consistency_weight
+        # Zeroed, not redesigned (docs/phase4.3-plan.md §4.2, B.2): neither shipped config sets this
+        # yet — retuning it is B.4's job, an explicit, separate escalation, not part of adding the
+        # term itself.
+        self.vertical_weight = vertical_weight
 
     def forward(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         loss_t = self.terrain_loss(preds, targets)
@@ -439,9 +517,11 @@ class CombinedLoss(nn.Module):
         if "occupancy_logits" in preds and target_band is not None:
             loss_occ = self.occupancy_loss(preds["occupancy_logits"], target_band)
             loss_ovh = self.overhang_loss(preds["occupancy_logits"], target_band)
+            loss_vert = self.vertical_loss(preds["occupancy_logits"], target_band)
         else:
             loss_occ = torch.tensor(0.0, device=preds["heightmap"].device)
             loss_ovh = torch.tensor(0.0, device=preds["heightmap"].device)
+            loss_vert = torch.tensor(0.0, device=preds["heightmap"].device)
 
         if "occupancy_logits" in preds:
             loss_con = self.consistency_loss(preds["heightmap"], preds["occupancy_logits"])
@@ -464,6 +544,8 @@ class CombinedLoss(nn.Module):
             total_loss = total_loss + self.overhang_weight * loss_ovh
         if self.consistency_weight > 0.0:
             total_loss = total_loss + self.consistency_weight * loss_con
+        if self.vertical_weight > 0.0:
+            total_loss = total_loss + self.vertical_weight * loss_vert
 
         components_dict = {
             "terrain": loss_t,
@@ -473,6 +555,7 @@ class CombinedLoss(nn.Module):
             "occupancy": loss_occ,
             "overhang": loss_ovh,
             "consistency": loss_con,
+            "vertical": loss_vert,
         }
         return total_loss, components_dict
 
