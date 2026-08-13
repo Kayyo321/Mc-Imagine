@@ -36,7 +36,8 @@ dist/
 Thumbs.db
 ehthumbs.db
 
-# Model artifacts (distributable .mcim are allowed)
+# Model artifacts
+*.mcim
 *.onnx
 *.pt
 *.pth
